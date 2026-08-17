@@ -73,7 +73,11 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
         }
     }
 
-    // 5. 正常退出（验证 exit）。
+    // 5. init 进入 shell：解释执行内置脚本（echo / print / 四则运算）。
+    let _ = write(STDOUT, b"[init] entering shell\n");
+    let code = shell::run();
+
+    // 6. shell 返回后正常退出（验证 exit）。
     let _ = write(STDOUT, b"[init] exiting normally\n");
-    exit(0)
+    exit(code)
 }

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 libsys = { path = "../libsys" }
+shell = { path = "../shell" }
 
 # 用户态裸机程序：无 unwinding 运行时，panic 直接 abort。
 [profile.dev]
