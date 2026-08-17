@@ -73,11 +73,45 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
         }
     }
 
-    // 5. init 进入 shell：解释执行内置脚本（echo / print / 四则运算）。
-    let _ = write(STDOUT, b"[init] entering shell\n");
-    let code = shell::run();
+    // 5. init 经 exec 系统调用加载并运行独立编译的 shell.elf（PID 2）。
+    //    不再编译期引用 shell crate，而是"运行 shell 程序"（ADR-003 纯 spawn）。
+    let _ = write(STDOUT, b"[init] launching shell via exec\n");
+    match libsys::exec(libsys::nr::PROG_SHELL) {
+        Ok(pid) => {
+            let _ = write(STDOUT, b"[init] shell started (pid ");
+            let mut buf = [0u8; 8];
+            let _ = write(STDOUT, dec_u64(pid, &mut buf));
+            let _ = write(STDOUT, b")\n");
+        }
+        Err(_) => {
+            let _ = write(STDOUT, b"[init] exec(shell) failed\n");
+        }
+    }
 
-    // 6. shell 返回后正常退出（验证 exit）。
-    let _ = write(STDOUT, b"[init] exiting normally\n");
-    exit(code)
+    // 6. init 完成引导职责，让出 CPU 并退出（shell 独立运行）。
+    let _ = write(STDOUT, b"[init] init done, exiting\n");
+    exit(0)
+}
+
+/// 把无符号整数格式化为十进制字节，写入 `buf`，返回有效长度。
+fn dec_u64(v: u64, buf: &mut [u8; 8]) -> &[u8] {
+    let mut tmp = [0u8; 20];
+    let mut n = v;
+    let mut i = 0;
+    if n == 0 {
+        buf[0] = b'0';
+        return &buf[..1];
+    }
+    while n > 0 {
+        tmp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        i += 1;
+    }
+    let mut j = 0;
+    while i > 0 {
+        i -= 1;
+        buf[j] = tmp[i];
+        j += 1;
+    }
+    &buf[..j]
 }
