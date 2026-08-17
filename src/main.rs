@@ -9,7 +9,7 @@
 #![no_std]
 #![no_main]
 
-use libsys::{brk, exit, info, write, STDOUT};
+use libsys::{brk, exit, info, write, yield_now, STDOUT};
 
 /// 把无符号整数格式化为十六进制字符串（写入固定缓冲），返回有效切片。
 ///
@@ -63,7 +63,17 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
         }
     }
 
-    // 4. 正常退出（验证 exit）。
+    // 4. 主动让出 CPU（验证 yield 原语；单进程下无可让出，立即返回）。
+    match yield_now() {
+        Ok(()) => {
+            let _ = write(STDOUT, b"[init] yielded cpu\n");
+        }
+        Err(_) => {
+            let _ = write(STDOUT, b"[init] yield failed\n");
+        }
+    }
+
+    // 5. 正常退出（验证 exit）。
     let _ = write(STDOUT, b"[init] exiting normally\n");
     exit(0)
 }
