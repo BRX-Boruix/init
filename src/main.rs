@@ -76,7 +76,7 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     // 5. init 经 exec 系统调用加载并运行独立编译的 shell.elf（PID 2）。
     //    不再编译期引用 shell crate，而是"运行 shell 程序"（ADR-003 纯 spawn）。
     let _ = write(STDOUT, b"[init] launching shell via exec\n");
-    match libsys::exec(libsys::nr::PROG_SHELL) {
+    match libsys::exec(libsys::nr::PROG_SHELL, &[]) {
         Ok(pid) => {
             let _ = write(STDOUT, b"[init] shell started (pid ");
             let mut buf = [0u8; 8];
