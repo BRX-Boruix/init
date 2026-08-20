@@ -112,10 +112,9 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
         let _ = write(STDOUT, &proc_bytes);
     }
 
-    // 5. init 经 exec 系统调用加载并运行独立编译的 shell.elf（PID 2）。
-    //    不再编译期引用 shell crate，而是"运行 shell 程序"（ADR-003 纯 spawn）。
-    let _ = write(STDOUT, b"[init] launching shell via exec\n");
-    match libsys::exec(libsys::nr::PROG_SHELL, &[]) {
+    // 5. init 经 exec_path 系统调用直接从 VFS /binaries/shell.elf 加载并运行独立进程（PID 2）。
+    let _ = write(STDOUT, b"[init] launching /binaries/shell.elf via VFS exec\n");
+    match libsys::exec_path("/binaries/shell.elf", &[]) {
         Ok(pid) => {
             let _ = write(STDOUT, b"[init] shell started (pid ");
             let mut buf = [0u8; 8];
@@ -123,7 +122,7 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
             let _ = write(STDOUT, b")\n");
         }
         Err(_) => {
-            let _ = write(STDOUT, b"[init] exec(shell) failed\n");
+            let _ = write(STDOUT, b"[init] exec_path(/binaries/shell.elf) failed\n");
         }
     }
 
