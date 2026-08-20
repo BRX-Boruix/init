@@ -100,6 +100,18 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
         }
     }
 
+    // 4.2 验证用户态 JSON 第一公民与特殊 VFS（M6.3: /system/cpu, /processes/list）。
+    let _ = write(STDOUT, b"[init] reading /system/cpu JSON...\n");
+    if let Ok(cpu_bytes) = libsys::read_to_end("/system/cpu") {
+        let _ = write(STDOUT, b"[init] /system/cpu: ");
+        let _ = write(STDOUT, &cpu_bytes);
+    }
+    let _ = write(STDOUT, b"[init] reading /processes/list JSON...\n");
+    if let Ok(proc_bytes) = libsys::read_to_end("/processes/list") {
+        let _ = write(STDOUT, b"[init] /processes/list: ");
+        let _ = write(STDOUT, &proc_bytes);
+    }
+
     // 5. init 经 exec 系统调用加载并运行独立编译的 shell.elf（PID 2）。
     //    不再编译期引用 shell crate，而是"运行 shell 程序"（ADR-003 纯 spawn）。
     let _ = write(STDOUT, b"[init] launching shell via exec\n");
