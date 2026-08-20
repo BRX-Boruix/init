@@ -73,6 +73,33 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
         }
     }
 
+    // 4.1 验证用户态 VFS 系统调用（M6.2: open/write/read/seek/readdir/mkdir/read_to_end）。
+    let _ = write(STDOUT, b"[init] testing userspace VFS syscalls...\n");
+    let _ = libsys::mkdir("/config/init_test", libsys::Permissions::all());
+    match libsys::open(
+        "/config/init_test/welcome.txt",
+        libsys::OpenFlags::CREATE_OR_TRUNCATE,
+        libsys::Permissions::all(),
+    ) {
+        Ok(fd) => {
+            let _ = libsys::write(fd, b"BORUIX userspace VFS syscalls OK!");
+            let _ = libsys::close(fd);
+            match libsys::read_to_end("/config/init_test/welcome.txt") {
+                Ok(bytes) => {
+                    let _ = write(STDOUT, b"[init] read_to_end: ");
+                    let _ = write(STDOUT, &bytes);
+                    let _ = write(STDOUT, b"\n");
+                }
+                Err(_) => {
+                    let _ = write(STDOUT, b"[init] read_to_end failed\n");
+                }
+            }
+        }
+        Err(_) => {
+            let _ = write(STDOUT, b"[init] open failed\n");
+        }
+    }
+
     // 5. init 经 exec 系统调用加载并运行独立编译的 shell.elf（PID 2）。
     //    不再编译期引用 shell crate，而是"运行 shell 程序"（ADR-003 纯 spawn）。
     let _ = write(STDOUT, b"[init] launching shell via exec\n");
