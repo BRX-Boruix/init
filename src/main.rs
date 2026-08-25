@@ -114,10 +114,13 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
 
     // 5. init 进入 supervisor 循环：拉起 shell → 等其退出 → 重生。
     //    类 SysV 登录循环语义，PID 1 永不退出。
+    //    也负责收尸被过继给 init 的孤儿进程，并区分日志。
     let _ = write(STDOUT, b"[init] entering supervisor loop\n");
+    let mut shell_pid = 0u64;
     loop {
         match libsys::exec_path("/binaries/shell.elf", &[]) {
             Ok(pid) => {
+                shell_pid = pid;
                 let mut buf = [0u8; 8];
                 let _ = write(STDOUT, b"[init] shell started (pid ");
                 let _ = write(STDOUT, dec_u64(pid, &mut buf));
@@ -130,13 +133,37 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
                 continue;
             }
         }
-        // 等任意子进程（shell 或其子进程被过继给 init）退出。
+        // 等任意子进程退出（shell 或被过继给 init 的孤儿）。
         match waitpid_any() {
             Ok(code) => {
-                let mut buf = [0u8; 8];
-                let _ = write(STDOUT, b"[init] child exited (code ");
-                let _ = write(STDOUT, dec_u64(code, &mut buf));
-                let _ = write(STDOUT, b"), respawning shell\n");
+                // 检查 shell 是否还活着：读 /processes/{shell_pid}/status。
+                // 若文件可读 → shell 还在，退出的是孤儿；
+                // 若 NotFound → shell 没了，需要重生。
+                let mut path_buf = [0u8; 32];
+                let prefix = b"/processes/";
+                let suffix = b"/status";
+                path_buf[..prefix.len()].copy_from_slice(prefix);
+                let mut pid_buf = [0u8; 8];
+                let pid_str = dec_u64(shell_pid, &mut pid_buf);
+                let start = prefix.len();
+                path_buf[start..start + pid_str.len()].copy_from_slice(pid_str);
+                let end = start + pid_str.len();
+                path_buf[end..end + suffix.len()].copy_from_slice(suffix);
+                let path = core::str::from_utf8(&path_buf[..end + suffix.len()])
+                    .unwrap_or("/processes/list");
+                if libsys::read_to_end(path).is_ok() {
+                    // shell 仍在运行 → 退出的是被过继给 init 的孤儿。
+                    let mut buf = [0u8; 8];
+                    let _ = write(STDOUT, b"[init] reaped orphan (code ");
+                    let _ = write(STDOUT, dec_u64(code, &mut buf));
+                    let _ = write(STDOUT, b"), continuing\n");
+                } else {
+                    // shell 已退出 → 需要重生。
+                    let mut buf = [0u8; 8];
+                    let _ = write(STDOUT, b"[init] shell exited (code ");
+                    let _ = write(STDOUT, dec_u64(code, &mut buf));
+                    let _ = write(STDOUT, b"), respawning\n");
+                }
             }
             Err(_) => {
                 let _ = write(STDOUT, b"[init] waitpid_any() failed, retrying\n");
