@@ -9,7 +9,7 @@
 #![no_std]
 #![no_main]
 
-use libsys::{brk, exit, info, write, yield_now, STDOUT};
+use libsys::{brk, info, waitpid_any, write, yield_now, STDOUT};
 
 /// 把无符号整数格式化为十六进制字符串（写入固定缓冲），返回有效切片。
 ///
@@ -112,23 +112,37 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
         let _ = write(STDOUT, &proc_bytes);
     }
 
-    // 5. init 经 exec_path 系统调用直接从 VFS /binaries/shell.elf 加载并运行独立进程（PID 2）。
-    let _ = write(STDOUT, b"[init] launching /binaries/shell.elf via VFS exec\n");
-    match libsys::exec_path("/binaries/shell.elf", &[]) {
-        Ok(pid) => {
-            let _ = write(STDOUT, b"[init] shell started (pid ");
-            let mut buf = [0u8; 8];
-            let _ = write(STDOUT, dec_u64(pid, &mut buf));
-            let _ = write(STDOUT, b")\n");
+    // 5. init 进入 supervisor 循环：拉起 shell → 等其退出 → 重生。
+    //    类 SysV 登录循环语义，PID 1 永不退出。
+    let _ = write(STDOUT, b"[init] entering supervisor loop\n");
+    loop {
+        match libsys::exec_path("/binaries/shell.elf", &[]) {
+            Ok(pid) => {
+                let mut buf = [0u8; 8];
+                let _ = write(STDOUT, b"[init] shell started (pid ");
+                let _ = write(STDOUT, dec_u64(pid, &mut buf));
+                let _ = write(STDOUT, b")\n");
+            }
+            Err(_) => {
+                let _ = write(STDOUT, b"[init] exec_path(shell.elf) failed, retrying...\n");
+                // 启动失败时短眠再试（避免忙转），走 TASK_WAIT(0, 500ms)
+                let _ = libsys::sleep(500_000_000);
+                continue;
+            }
         }
-        Err(_) => {
-            let _ = write(STDOUT, b"[init] exec_path(/binaries/shell.elf) failed\n");
+        // 等任意子进程（shell 或其子进程被过继给 init）退出。
+        match waitpid_any() {
+            Ok(code) => {
+                let mut buf = [0u8; 8];
+                let _ = write(STDOUT, b"[init] child exited (code ");
+                let _ = write(STDOUT, dec_u64(code, &mut buf));
+                let _ = write(STDOUT, b"), respawning shell\n");
+            }
+            Err(_) => {
+                let _ = write(STDOUT, b"[init] waitpid_any() failed, retrying\n");
+            }
         }
     }
-
-    // 6. init 完成引导职责，让出 CPU 并退出（shell 独立运行）。
-    let _ = write(STDOUT, b"[init] init done, exiting\n");
-    exit(0)
 }
 
 /// 把无符号整数格式化为十进制字节，写入 `buf`，返回有效长度。
