@@ -118,7 +118,7 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     let _ = write(STDOUT, b"[init] entering supervisor loop\n");
     let mut shell_pid = 0u64;
     loop {
-        match libsys::exec_path("/binaries/shell.elf", &[]) {
+        match libsys::exec_path("/programs/shell.elf", &[]) {
             Ok(pid) => {
                 shell_pid = pid;
                 let mut buf = [0u8; 8];
