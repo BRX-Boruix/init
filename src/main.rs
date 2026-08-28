@@ -100,10 +100,10 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
         }
     }
 
-    // 4.2 验证用户态 JSON 第一公民与特殊 VFS（M6.3: /system/cpu, /processes/list）。
-    let _ = write(STDOUT, b"[init] reading /system/cpu JSON...\n");
-    if let Ok(cpu_bytes) = libsys::read_to_end("/system/cpu") {
-        let _ = write(STDOUT, b"[init] /system/cpu: ");
+    // 4.2 验证用户态 JSON 第一公民与特殊 VFS（M6.3: /system/info/cpu, /processes/list）。
+    let _ = write(STDOUT, b"[init] reading /system/info/cpu JSON...\n");
+    if let Ok(cpu_bytes) = libsys::read_to_end("/system/info/cpu") {
+        let _ = write(STDOUT, b"[init] /system/info/cpu: ");
         let _ = write(STDOUT, &cpu_bytes);
     }
     let _ = write(STDOUT, b"[init] reading /processes/list JSON...\n");
