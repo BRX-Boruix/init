@@ -116,7 +116,7 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     //    类 SysV 登录循环语义，PID 1 永不退出。
     //    也负责收尸被过继给 init 的孤儿进程，并区分日志。
     let _ = write(STDOUT, b"[init] entering supervisor loop\n");
-    let mut shell_pid = 0u64;
+    let mut shell_pid: u64;
     loop {
         match libsys::exec_path("/programs/shell.elf", &[]) {
             Ok(pid) => {
