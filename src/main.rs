@@ -112,6 +112,21 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
         let _ = write(STDOUT, &proc_bytes);
     }
 
+    // 4.3 拉起用户态卷管理守护进程 volumed（ADR-030 §决策1a / P2-1）。
+    //    独立后台进程，经 VOLUME syscall + DEVICE 事件通道做卷自动挂载编排；
+    //    不等待（守护进程自身永不退出）。启动失败不阻断 shell（非致命）。
+    match libsys::exec_path("/programs/volumed.elf", &[]) {
+        Ok(pid) => {
+            let mut buf = [0u8; 8];
+            let _ = write(STDOUT, b"[init] volumed started (pid ");
+            let _ = write(STDOUT, dec_u64(pid, &mut buf));
+            let _ = write(STDOUT, b")\n");
+        }
+        Err(_) => {
+            let _ = write(STDOUT, b"[init] exec_path(volumed.elf) failed (non-fatal)\n");
+        }
+    }
+
     // 5. init 进入 supervisor 循环：拉起 shell → 等其退出 → 重生。
     //    类 SysV 登录循环语义，PID 1 永不退出。
     //    也负责收尸被过继给 init 的孤儿进程，并区分日志。
