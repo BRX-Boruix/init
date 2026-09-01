@@ -310,7 +310,7 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
         }
         // 等任意子进程退出（shell 或被过继给 init 的孤儿）。
         match waitpid_any() {
-            Ok(code) => {
+            Ok(wr) => {
                 // 检查 shell 是否还活着：读 /processes/{shell_pid}/status。
                 // 若文件可读 → shell 还在，退出的是孤儿；
                 // 若 NotFound → shell 没了，需要重生。
@@ -330,13 +330,13 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
                     // shell 仍在运行 → 退出的是被过继给 init 的孤儿。
                     let mut buf = [0u8; 8];
                     let _ = write(STDOUT, b"[init] reaped orphan (code ");
-                    let _ = write(STDOUT, dec_u64(code, &mut buf));
+                    let _ = write(STDOUT, dec_u64(wr.code, &mut buf));
                     let _ = write(STDOUT, b"), continuing\n");
                 } else {
                     // shell 已退出 → 需要重生。
                     let mut buf = [0u8; 8];
                     let _ = write(STDOUT, b"[init] shell exited (code ");
-                    let _ = write(STDOUT, dec_u64(code, &mut buf));
+                    let _ = write(STDOUT, dec_u64(wr.code, &mut buf));
                     let _ = write(STDOUT, b"), respawning\n");
                 }
             }
