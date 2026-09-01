@@ -26,4 +26,11 @@ cargo build --manifest-path init/Cargo.toml --target x86_64-unknown-none --relea
 ## 内容规划
 - `src/main.rs` — 入口（导出 `user_main`，libsys 的 `_start` 调用它）
 - `src/services.rs` — 服务拉起与监督（待实现）
-- 依赖 `libsys`（未来叠加 `libc`）
+- 依赖 `libsys` + `libc`
+
+## libc 开机自检（libc_selftest）
+
+init 启动时调用 `libc_selftest()`，验证「内核→libsys→libc→init」最小链路在开机即通：
+逐项输出 `[init] libc: ... OK/FAIL`，末尾汇总 `[init] libc: selftest passed=N failed=M`。
+覆盖：malloc/free 堆分配、strlen/strcmp、snprintf（整数+浮点）、strtol、time。
+防御式——失败仅记录，不中断启动流程。

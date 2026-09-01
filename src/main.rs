@@ -87,6 +87,114 @@ fn signal_selftest() {
     }
 }
 
+
+/// libc 最小链路自检（ADR 目标：内核→libsys→libc→init 在开机即通）。
+///
+/// 验证 libc 的核心 C ABI（malloc/string/printf/strtol/time），打印逐项
+/// OK/FAIL 与汇总。防御式：失败仅记录，不中断启动流程。
+fn libc_selftest() {
+    let _ = write(STDOUT, b"[init] libc: testing core C ABI...\n");
+    let mut pass = 0u32;
+    let mut fail = 0u32;
+
+    // 1) malloc/free 堆分配。
+    unsafe {
+        let p = libc::malloc::malloc(48);
+        if !p.is_null() {
+            *p.add(0) = 0x42;
+            *p.add(47) = 0x43;
+            if p.add(0).read() == 0x42 && p.add(47).read() == 0x43 {
+                pass += 1;
+                let _ = write(STDOUT, b"[init] libc: malloc/free OK\n");
+            } else {
+                fail += 1;
+                let _ = write(STDOUT, b"[init] libc: malloc writable FAIL\n");
+            }
+            libc::malloc::free(p);
+        } else {
+            fail += 1;
+            let _ = write(STDOUT, b"[init] libc: malloc FAIL\n");
+        }
+    }
+
+    // 2) string：strlen/strcmp。
+    unsafe {
+        let a = b"hello\0".as_ptr() as *const i8;
+        if libc::string::strlen(a) == 5 && libc::string::strcmp(a, b"hello\0".as_ptr() as *const i8) == 0 {
+            pass += 1;
+            let _ = write(STDOUT, b"[init] libc: string OK\n");
+        } else {
+            fail += 1;
+            let _ = write(STDOUT, b"[init] libc: string FAIL\n");
+        }
+    }
+
+    // 3) snprintf（格式引擎 + 浮点）。
+    unsafe {
+        let mut buf = [0u8; 64];
+        let n = libc::stdio::snprintf(
+            buf.as_mut_ptr() as *mut i8, buf.len(),
+            b"v=%d f=%.2f\0".as_ptr() as *const i8, 7, 3.14,
+        );
+        // 期望 "v=7 f=3.14"（长度 10）。
+        if n == 10 {
+            pass += 1;
+            let _ = write(STDOUT, b"[init] libc: snprintf OK\n");
+        } else {
+            fail += 1;
+            let _ = write(STDOUT, b"[init] libc: snprintf FAIL\n");
+        }
+    }
+
+    // 4) strtol 整数解析。
+    unsafe {
+        if libc::stdlib::strtol(b"-99\0".as_ptr() as *const i8, core::ptr::null_mut(), 10) == -99 {
+            pass += 1;
+            let _ = write(STDOUT, b"[init] libc: strtol OK\n");
+        } else {
+            fail += 1;
+            let _ = write(STDOUT, b"[init] libc: strtol FAIL\n");
+        }
+    }
+
+    // 5) time 墙钟读数。
+    {
+        if libc::time::time(core::ptr::null_mut()) > 0 {
+            pass += 1;
+            let _ = write(STDOUT, b"[init] libc: time OK\n");
+        } else {
+            fail += 1;
+            let _ = write(STDOUT, b"[init] libc: time FAIL\n");
+        }
+    }
+
+    // 汇总。
+    let _ = write(STDOUT, b"[init] libc: selftest passed=");
+    let mut b1 = [0u8; 8];
+    let pb = u64_to_dec(pass as u64, &mut b1);
+    let _ = write(STDOUT, pb);
+    let _ = write(STDOUT, b" failed=");
+    let mut b2 = [0u8; 8];
+    let fb = u64_to_dec(fail as u64, &mut b2);
+    let _ = write(STDOUT, fb);
+    let _ = write(STDOUT, b"\n");
+}
+
+/// 把 u64 写成十进制字节（最小，无前导零）。
+fn u64_to_dec(mut v: u64, buf: &mut [u8; 8]) -> &[u8] {
+    if v == 0 {
+        buf[0] = b'0';
+        return &buf[..1];
+    }
+    let mut i = buf.len();
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    &buf[i..]
+}
+
 /// init 主流程：打印信息、查询内核版本与堆断点、退出。
 #[unsafe(no_mangle)]
 pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
@@ -121,6 +229,9 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
 
     // 4.2 ADR-034 S1-14：信号端到端自测（防御式，失败不中断启动）。
     signal_selftest();
+
+    // 4.2.1 libc 最小链路自检（内核→libsys→libc→init 开机即通；防御式）。
+    libc_selftest();
 
     // 4.1 验证用户态 VFS 系统调用（M6.2: open/write/read/seek/readdir/mkdir/read_to_end）。
     let _ = write(STDOUT, b"[init] testing userspace VFS syscalls...\n");
