@@ -9,6 +9,7 @@
 #![no_std]
 #![no_main]
 
+use core::sync::atomic::{AtomicU32, Ordering};
 use libsys::{brk, info, waitpid_any, write, yield_now, STDOUT};
 
 /// 把无符号整数格式化为十六进制字符串（写入固定缓冲），返回有效切片。
@@ -39,6 +40,51 @@ fn print_hex(label: &[u8], v: u64) {
     let _ = write(STDOUT, b" = ");
     let _ = write(STDOUT, s);
     let _ = write(STDOUT, b"\n");
+}
+
+// ---- ADR-034 S1-14：信号端到端自测（libsys action/raise + 用户 handler + sigreturn） ----
+
+/// 用户 SIGUSR1 handler 置位标记（供主流程验证 handler 确实被投递并 sigreturn 恢复）。
+static SIG_HANDLER_RAN: AtomicU32 = AtomicU32::new(0);
+
+/// naked handler：置位 `SIG_HANDLER_RAN` 后 `ret` → restorer → rt_sigreturn。
+/// 内核 `deliver_handler` 把 handler 返回地址写成 restorer 地址，`ret` 即跳 restorer。
+#[unsafe(naked)]
+unsafe extern "C" fn init_sigusr1_handler() {
+    core::arch::naked_asm!(
+        "mov dword ptr [rip + {ran}], 1",
+        "ret",
+        ran = sym SIG_HANDLER_RAN,
+    );
+}
+
+/// S1-14 自测：注册 SIGUSR1 handler → 向自身 raise → 返回用户态时投递进 handler
+/// → restorer → rt_sigreturn 恢复。任何失败打印错误但不中断后续启动（防御式）。
+fn signal_selftest() {
+    let _ = write(STDOUT, b"[init] signal: testing S1-14 action/raise/handler...\n");
+    let handler_addr = init_sigusr1_handler as *const () as usize as u64;
+    if let Err(_) = libsys::signal::action(libsys::signal::SIGUSR1, handler_addr, 0) {
+        let _ = write(STDOUT, b"[init] signal: action(SIGUSR1) failed\n");
+        return;
+    }
+    let _ = write(STDOUT, b"[init] signal: action(SIGUSR1, handler) ok\n");
+    // 向自身（init 恒为 PID 1）raise SIGUSR1。
+    match libsys::signal::raise(1, libsys::signal::SIGUSR1) {
+        Ok(_) => {}
+        Err(_) => {
+            let _ = write(STDOUT, b"[init] signal: raise(SIGUSR1) failed\n");
+            return;
+        }
+    }
+    let _ = write(STDOUT, b"[init] signal: raise ok, awaiting delivery...\n");
+    // 让出触发返回用户态投递（若 raise 返回时未投递，yield 再给一次机会）。
+    let _ = yield_now();
+    let _ = yield_now();
+    if SIG_HANDLER_RAN.load(Ordering::SeqCst) == 1 {
+        let _ = write(STDOUT, b"[init] signal: SIGUSR1 handler ran + sigreturn ok (S1-14 PASS)\n");
+    } else {
+        let _ = write(STDOUT, b"[init] signal: handler did NOT run (S1-14 FAIL)\n");
+    }
 }
 
 /// init 主流程：打印信息、查询内核版本与堆断点、退出。
@@ -72,6 +118,9 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
             let _ = write(STDOUT, b"[init] yield failed\n");
         }
     }
+
+    // 4.2 ADR-034 S1-14：信号端到端自测（防御式，失败不中断启动）。
+    signal_selftest();
 
     // 4.1 验证用户态 VFS 系统调用（M6.2: open/write/read/seek/readdir/mkdir/read_to_end）。
     let _ = write(STDOUT, b"[init] testing userspace VFS syscalls...\n");
