@@ -287,6 +287,21 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
         }
     }
 
+    // 4.4 拉起阶段4 FP 演示进程 fpcheck（user-mode FP demo，会跑在 AP 上）。
+    //    独立后台进程：真实 double 运算 + libc snprintf %.2f 输出，证明 AP 能跑
+    //    用户态浮点/SSE 而无 #NM。RR 分发下它与 volumed/shell 轮流落各核。非致命。
+    match libsys::exec_path("/programs/fpcheck.elf", &[]) {
+        Ok(pid) => {
+            let mut buf = [0u8; 8];
+            let _ = write(STDOUT, b"[init] fpcheck started (pid ");
+            let _ = write(STDOUT, dec_u64(pid, &mut buf));
+            let _ = write(STDOUT, b")\n");
+        }
+        Err(_) => {
+            let _ = write(STDOUT, b"[init] exec_path(fpcheck.elf) failed (non-fatal)\n");
+        }
+    }
+
     // 5. init 进入 supervisor 循环：拉起 shell → 等其退出 → 重生。
     //    类 SysV 登录循环语义，PID 1 永不退出。
     //    也负责收尸被过继给 init 的孤儿进程，并区分日志。
