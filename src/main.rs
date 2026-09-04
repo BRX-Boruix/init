@@ -10,7 +10,7 @@
 #![no_main]
 
 use core::sync::atomic::{AtomicU32, Ordering};
-use libsys::{brk, info, waitpid_any, write, yield_now, STDOUT};
+use libsys::{brk, exec_path, info, kill, waitpid_any, write, yield_now, STDOUT};
 
 /// 把无符号整数格式化为十六进制字符串（写入固定缓冲），返回有效切片。
 ///
@@ -195,6 +195,43 @@ fn u64_to_dec(mut v: u64, buf: &mut [u8; 8]) -> &[u8] {
     &buf[i..]
 }
 
+/// 跨核 spawn + SIGKILL terminate 风暴（S1 迁移 + 既有跨核终止 bug 的复现/回归脚手架）。
+///
+/// 每轮派生 W 个 spinburn 长驻子进程（least-loaded 分到各核），BSP 对其逐 kill(SIGKILL)，
+/// 再 waitpid_any 收尸。复现: 跨核 SIGKILL '运行中/仅存其核' 的进程后, 被杀进程未被
+/// 及时切走/可收尸 => 系统冻结。修复后此风暴应能多轮全绿(spawn==killed==reaped)。
+fn cross_core_sigkill_storm() {
+    const W: u32 = 5;
+    const ROUNDS: u32 = 4;
+    let _ = write(STDOUT, b"[init] cross-core SIGKILL storm: start\n");
+    let mut rbuf = [0u8; 8];
+    for round in 0..ROUNDS {
+        let mut pids = [0u64; 8];
+        let mut n = 0u32;
+        for _ in 0..W {
+            if let Ok(p) = exec_path("/programs/spinburn.elf", &[]) {
+                if (n as usize) < pids.len() { pids[n as usize] = p; n += 1; }
+            }
+            for _ in 0..100 { let _ = yield_now(); }
+        }
+        if n == 0 { continue; }
+        for _ in 0..2500 { let _ = yield_now(); }
+        let mut killed = 0u32;
+        for i in 0..n { if kill(pids[i as usize], 9).is_ok() { killed += 1; } }
+        let mut reaped = 0u32;
+        for _ in 0..n {
+            match waitpid_any() { Ok(_) => { reaped += 1; } Err(_) => { break; } }
+        }
+        let _ = write(STDOUT, b"[init] storm round ");
+        let _ = write(STDOUT, dec_u64(round as u64, &mut rbuf));
+        let _ = write(STDOUT, b": spawn="); let _ = write(STDOUT, dec_u64(n as u64, &mut rbuf));
+        let _ = write(STDOUT, b" killed="); let _ = write(STDOUT, dec_u64(killed as u64, &mut rbuf));
+        let _ = write(STDOUT, b" reaped="); let _ = write(STDOUT, dec_u64(reaped as u64, &mut rbuf));
+        let _ = write(STDOUT, b"\n");
+    }
+    let _ = write(STDOUT, b"[init] cross-core SIGKILL storm done\n");
+}
+
 /// init 主流程：打印信息、查询内核版本与堆断点、退出。
 #[unsafe(no_mangle)]
 pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
@@ -301,6 +338,9 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
             let _ = write(STDOUT, b"[init] exec_path(fpcheck.elf) failed (non-fatal)\n");
         }
     }
+
+    // 4.5 per-pid 锁化 + 跨核终止既有 bug 验证：跨核 spawn + SIGKILL terminate 风暴。
+    cross_core_sigkill_storm();
 
     // 5. init 进入 supervisor 循环：拉起 shell → 等其退出 → 重生。
     //    类 SysV 登录循环语义，PID 1 永不退出。
