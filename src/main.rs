@@ -195,6 +195,62 @@ fn u64_to_dec(mut v: u64, buf: &mut [u8; 8]) -> &[u8] {
     &buf[i..]
 }
 
+/// T1-8：拉起 threaddemo（端到端同进程双线程示例）并等待其完成、收尸。
+///
+/// 真实用户程序 /programs/threaddemo.elf 在自身进程内 thread_spawn 两个线程（共享
+/// 组长 Arc 地址空间、各自独立 mmap 用户栈）→ 各自打印 → thread_exit → 组长 join。
+/// init 以 exec_path 派生它并等 waitpid_any 收尸到其 pid。线程demo 秒级完成，故本
+/// 阶段其它长驻子进程（volumed/fpcheck）不会先退出。
+///
+/// SMP 语义：waitpid_any 在"本核此刻无其它就绪进程可接盘、无法阻塞"时会返回
+/// Err(WouldBlock/NotFound)——这**不是** threaddemo 已退/不存在，只是当前无法阻塞
+/// 等待。故用「yield 让出 + 重试 waitpid_any」轮询直到真正收尸到 threaddemo 的 pid：
+/// threaddemo 完成后留 zombie，随后的 waitpid_any 必能同步收尸。**绝不**在未收尸
+/// threaddemo 前就放行进入下一阶段（跨核风暴），以免风暴的跨核 SIGKILL 与仍在跑的
+/// threaddemo 线程并发触发调度竞争。
+fn threaddemo_launch() {
+    let _ = write(STDOUT, b"[init] launching threaddemo (T1-8 two-thread demo)\n");
+    let pid = match libsys::exec_path("/programs/threaddemo.elf", &[]) {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = write(STDOUT, b"[init] exec_path(threaddemo.elf) failed (non-fatal)\n");
+            return;
+        }
+    };
+    let mut bbuf = [0u8; 8];
+    let _ = write(STDOUT, b"[init] threaddemo spawned (pid ");
+    let _ = write(STDOUT, dec_u64(pid, &mut bbuf));
+    let _ = write(STDOUT, b"), waiting for it to join both threads...\n");
+    // yield + waitpid_any 轮询，直到收尸 threaddemo 本体。Err（WouldBlock/NotFound）
+    // 表示当前核心此刻无法阻塞等待（非 threaddemo 已死），让出再试；上限 20000 次
+    // yield（约数秒）后仍未收到则记录并放行（防御式，理论上不达）。若意外收尸到
+    // volumed/fpcheck 等非 threaddemo 子进程，记录后继续等 threaddemo。
+    let mut spins: u32 = 0;
+    loop {
+        match waitpid_any() {
+            Ok(wr) if wr.pid == pid => {
+                let _ = write(STDOUT, b"[init] threaddemo reaped (code ");
+                let _ = write(STDOUT, dec_u64(wr.code, &mut bbuf));
+                let _ = write(STDOUT, b")\n");
+                break;
+            }
+            Ok(wr) => {
+                let _ = write(STDOUT, b"[init] waitpid_any reaped other child pid=");
+                let _ = write(STDOUT, dec_u64(wr.pid, &mut bbuf));
+                let _ = write(STDOUT, b" (continuing)\n");
+            }
+            Err(_) => {
+                spins += 1;
+                if spins > 20000 {
+                    let _ = write(STDOUT, b"[init] threaddemo reap timeout (giving up)\n");
+                    return;
+                }
+                let _ = yield_now();
+            }
+        }
+    }
+}
+
 /// 跨核 spawn + SIGKILL terminate 风暴（S1 迁移 + 既有跨核终止 bug 的复现/回归脚手架）。
 ///
 /// 每轮派生 W 个 spinburn 长驻子进程（least-loaded 分到各核），BSP 对其逐 kill(SIGKILL)，
@@ -338,6 +394,10 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
             let _ = write(STDOUT, b"[init] exec_path(fpcheck.elf) failed (non-fatal)\n");
         }
     }
+
+    // 4.4.1 T1-8：端到端同进程双线程示例（threaddemo）。放风暴前执行并专候收尸，
+    //    使风暴的 waitpid_any 不会误收 threaddemo 的僵尸。
+    threaddemo_launch();
 
     // 4.5 per-pid 锁化 + 跨核终止既有 bug 验证：跨核 spawn + SIGKILL terminate 风暴。
     cross_core_sigkill_storm();
