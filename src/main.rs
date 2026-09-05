@@ -251,6 +251,37 @@ fn threaddemo_launch() {
     }
 }
 
+/// T2-0：拉起 chelldemo（第一个真实 freestanding C 程序，x86-64 clang/lld 交叉链 +
+/// crt0 + 直连 syscall，不依赖 Rust libc）并收尸，验证 C 运行时地基端到端。
+/// chelldemo 立即打印并 exit(0)，故快速 poll 收尸即可；失败非致命。
+fn chelldemo_launch() {
+    let _ = write(STDOUT, b"[init] launching chelldemo (T2-0 C runtime, freestanding clang)\n");
+    let pid = match libsys::exec_path("/programs/chelldemo.elf", &[]) {
+        Ok(p) => p,
+        Err(_) => { let _ = write(STDOUT, b"[init] exec_path(chelldemo.elf) failed (non-fatal)\n"); return; }
+    };
+    let mut bbuf = [0u8; 8];
+    let _ = write(STDOUT, b"[init] chelldemo spawned (pid ");
+    let _ = write(STDOUT, dec_u64(pid, &mut bbuf));
+    let _ = write(STDOUT, b")\n");
+    let mut spins: u32 = 0;
+    loop {
+        match waitpid_any() {
+            Ok(wr) if wr.pid == pid => {
+                let _ = write(STDOUT, b"[init] chelldemo reaped (code ");
+                let _ = write(STDOUT, dec_u64(wr.code, &mut bbuf));
+                let _ = write(STDOUT, b")\n");
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                spins += 1;
+                if spins > 10000 { let _ = write(STDOUT, b"[init] chelldemo reap timeout\n"); return; }
+                let _ = yield_now();
+            }
+        }
+    }
+}
 /// 跨核 spawn + SIGKILL terminate 风暴（S1 迁移 + 既有跨核终止 bug 的复现/回归脚手架）。
 ///
 /// 每轮派生 W 个 spinburn 长驻子进程（least-loaded 分到各核），BSP 对其逐 kill(SIGKILL)，
@@ -398,6 +429,9 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     // 4.4.1 T1-8：端到端同进程双线程示例（threaddemo）。放风暴前执行并专候收尸，
     //    使风暴的 waitpid_any 不会误收 threaddemo 的僵尸。
     threaddemo_launch();
+
+    // T2-0：真实 freestanding C 程序（x86-64 clang/lld 交叉链 + crt0）端到端。
+    chelldemo_launch();
 
     // 4.5 per-pid 锁化 + 跨核终止既有 bug 验证：跨核 spawn + SIGKILL terminate 风暴。
     cross_core_sigkill_storm();
