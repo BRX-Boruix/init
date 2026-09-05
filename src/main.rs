@@ -282,6 +282,36 @@ fn chelldemo_launch() {
         }
     }
 }
+/// T2-3：拉起 pthreaddemo（C pthread 生命周期端到端：create/join/detach/self）并收尸。
+/// 快速执行并 exit(0)；失败非致命。
+fn pthreaddemo_launch() {
+    let _ = write(STDOUT, b"[init] launching pthreaddemo (T2-3 C pthread lifecycle)\n");
+    let pid = match libsys::exec_path("/programs/pthreaddemo.elf", &[]) {
+        Ok(p) => p,
+        Err(_) => { let _ = write(STDOUT, b"[init] exec_path(pthreaddemo.elf) failed (non-fatal)\n"); return; }
+    };
+    let mut bbuf = [0u8; 8];
+    let _ = write(STDOUT, b"[init] pthreaddemo spawned (pid ");
+    let _ = write(STDOUT, dec_u64(pid, &mut bbuf));
+    let _ = write(STDOUT, b")\n");
+    let mut spins: u32 = 0;
+    loop {
+        match waitpid_any() {
+            Ok(wr) if wr.pid == pid => {
+                let _ = write(STDOUT, b"[init] pthreaddemo reaped (code ");
+                let _ = write(STDOUT, dec_u64(wr.code, &mut bbuf));
+                let _ = write(STDOUT, b")\n");
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                spins += 1;
+                if spins > 20000 { let _ = write(STDOUT, b"[init] pthreaddemo reap timeout\n"); return; }
+                let _ = yield_now();
+            }
+        }
+    }
+}
 /// 跨核 spawn + SIGKILL terminate 风暴（S1 迁移 + 既有跨核终止 bug 的复现/回归脚手架）。
 ///
 /// 每轮派生 W 个 spinburn 长驻子进程（least-loaded 分到各核），BSP 对其逐 kill(SIGKILL)，
@@ -432,6 +462,9 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
 
     // T2-0：真实 freestanding C 程序（x86-64 clang/lld 交叉链 + crt0）端到端。
     chelldemo_launch();
+
+    // T2-3：C pthread 生命周期（create/join/detach/self）端到端。
+    pthreaddemo_launch();
 
     // 4.5 per-pid 锁化 + 跨核终止既有 bug 验证：跨核 spawn + SIGKILL terminate 风暴。
     cross_core_sigkill_storm();
