@@ -312,6 +312,36 @@ fn pthreaddemo_launch() {
         }
     }
 }
+/// T2-4：拉起 pthread_syncdemo（C pthread 互斥/condvar/信号量端到端）并收尸。
+/// 快速执行并 exit(0)；失败非致命。
+fn pthread_syncdemo_launch() {
+    let _ = write(STDOUT, b"[init] launching pthread_syncdemo (T2-4 C mutex/cond/sem)\n");
+    let pid = match libsys::exec_path("/programs/pthread_syncdemo.elf", &[]) {
+        Ok(p) => p,
+        Err(_) => { let _ = write(STDOUT, b"[init] exec_path(pthread_syncdemo.elf) failed (non-fatal)\n"); return; }
+    };
+    let mut bbuf = [0u8; 8];
+    let _ = write(STDOUT, b"[init] pthread_syncdemo spawned (pid ");
+    let _ = write(STDOUT, dec_u64(pid, &mut bbuf));
+    let _ = write(STDOUT, b")\n");
+    let mut spins: u32 = 0;
+    loop {
+        match waitpid_any() {
+            Ok(wr) if wr.pid == pid => {
+                let _ = write(STDOUT, b"[init] pthread_syncdemo reaped (code ");
+                let _ = write(STDOUT, dec_u64(wr.code, &mut bbuf));
+                let _ = write(STDOUT, b")\n");
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                spins += 1;
+                if spins > 40000 { let _ = write(STDOUT, b"[init] pthread_syncdemo reap timeout\n"); return; }
+                let _ = yield_now();
+            }
+        }
+    }
+}
 /// 跨核 spawn + SIGKILL terminate 风暴（S1 迁移 + 既有跨核终止 bug 的复现/回归脚手架）。
 ///
 /// 每轮派生 W 个 spinburn 长驻子进程（least-loaded 分到各核），BSP 对其逐 kill(SIGKILL)，
@@ -465,6 +495,9 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
 
     // T2-3：C pthread 生命周期（create/join/detach/self）端到端。
     pthreaddemo_launch();
+
+    // T2-4：C pthread 互斥/condvar/信号量（用户原子 + SYNC park）端到端。
+    pthread_syncdemo_launch();
 
     // 4.5 per-pid 锁化 + 跨核终止既有 bug 验证：跨核 spawn + SIGKILL terminate 风暴。
     cross_core_sigkill_storm();
