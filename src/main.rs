@@ -342,6 +342,43 @@ fn pthread_syncdemo_launch() {
         }
     }
 }
+/// 通用 C 程序拉起 + 收尸：exec_path + waitpid_any 轮询，超时容忍。
+fn launch_c_prog(path: &str, tag: &str) {
+    let mut msg = [0u8; 96];
+    let mut n = 0;
+    for b in b"[init] launching ".iter() { msg[n] = *b; n += 1; }
+    for b in tag.bytes() { msg[n] = b; n += 1; }
+    for b in b"\n".iter() { msg[n] = *b; n += 1; }
+    let _ = write(STDOUT, &msg[..n]);
+    let pid = match libsys::exec_path(path, &[]) {
+        Ok(pp) => pp,
+        Err(_) => {
+            let _ = write(STDOUT, b"[init] exec_path failed (non-fatal)\n");
+            return;
+        }
+    };
+    let mut spins: u32 = 0;
+    loop {
+        match waitpid_any() {
+            Ok(wr) if wr.pid == pid => {
+                let mut rp = [0u8; 8];
+                let _ = write(STDOUT, b"[init] ");
+                let _ = write(STDOUT, tag.as_bytes());
+                let _ = write(STDOUT, b" reaped (code ");
+                let _ = write(STDOUT, dec_u64(wr.code, &mut rp));
+                let _ = write(STDOUT, b")\n");
+                return;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                spins += 1;
+                if spins > 80000 { let _ = write(STDOUT, b"[init] reap timeout\n"); return; }
+                let _ = yield_now();
+            }
+        }
+    }
+}
+
 /// 跨核 spawn + SIGKILL terminate 风暴（S1 迁移 + 既有跨核终止 bug 的复现/回归脚手架）。
 ///
 /// 每轮派生 W 个 spinburn 长驻子进程（least-loaded 分到各核），BSP 对其逐 kill(SIGKILL)，
@@ -498,6 +535,9 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
 
     // T2-4：C pthread 互斥/condvar/信号量（用户原子 + SYNC park）端到端。
     pthread_syncdemo_launch();
+
+    // T2-5：真实 pthread 递归/join 基准（第三方惯用法）端到端。
+    launch_c_prog("/programs/pthread_bench.elf", "pthread_bench");
 
     // 4.5 per-pid 锁化 + 跨核终止既有 bug 验证：跨核 spawn + SIGKILL terminate 风暴。
     cross_core_sigkill_storm();
