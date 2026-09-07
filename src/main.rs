@@ -508,6 +508,21 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
         }
     }
 
+    // 4.3.1 拉起运行时驱动自动装载守护 driverd（ADR-037 决策 4 / P2-1/P2-2）。
+    //    独立后台进程：开机扫描 /modules 声明并 spawn 驱动认领设备、监听设备事件、
+    //    驱动崩溃/退出后自动重拉。永不退出；启动失败不阻断 shell（非致命）。
+    match libsys::exec_path("/programs/driverd.elf", &[]) {
+        Ok(pid) => {
+            let mut buf = [0u8; 8];
+            let _ = write(STDOUT, b"[init] driverd started (pid ");
+            let _ = write(STDOUT, dec_u64(pid, &mut buf));
+            let _ = write(STDOUT, b")\n");
+        }
+        Err(_) => {
+            let _ = write(STDOUT, b"[init] exec_path(driverd.elf) failed (non-fatal)\n");
+        }
+    }
+
     // 4.4 拉起阶段4 FP 演示进程 fpcheck（user-mode FP demo，会跑在 AP 上）。
     //    独立后台进程：真实 double 运算 + libc snprintf %.2f 输出，证明 AP 能跑
     //    用户态浮点/SSE 而无 #NM。RR 分发下它与 volumed/shell 轮流落各核。非致命。
