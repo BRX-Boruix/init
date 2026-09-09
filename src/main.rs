@@ -523,6 +523,21 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
         }
     }
 
+    // 4.3.2 拉起阶段三 intel-hda（ICH6 HD Audio）用户态声卡驱动带起。
+    //    无 HDA 控制器（QEMU 未加 -device intel-hda）时驱动自查无设备并干净退出——
+    //    非致命。加 -device intel-hda 后驱动认领/复位/枚举 codec（阶段三带起）。
+    match libsys::exec_path("/programs/intel-hda.elf", &[]) {
+        Ok(pid) => {
+            let mut buf = [0u8; 8];
+            let _ = write(STDOUT, b"[init] intel-hda started (pid ");
+            let _ = write(STDOUT, dec_u64(pid, &mut buf));
+            let _ = write(STDOUT, b")\n");
+        }
+        Err(_) => {
+            let _ = write(STDOUT, b"[init] exec_path(intel-hda.elf) failed (non-fatal)\n");
+        }
+    }
+
     // 4.4 拉起阶段4 FP 演示进程 fpcheck（user-mode FP demo，会跑在 AP 上）。
     //    独立后台进程：真实 double 运算 + libc snprintf %.2f 输出，证明 AP 能跑
     //    用户态浮点/SSE 而无 #NM。RR 分发下它与 volumed/shell 轮流落各核。非致命。
