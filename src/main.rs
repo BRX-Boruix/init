@@ -718,6 +718,16 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     let _ = write(STDOUT, b"[init] audio ring consumer attached = ");
     let _ = write(STDOUT, if attached { b"true\n" } else { b"false\n" });
 
+    // ---- 4.3.3.1 批次四 M1：拉起用户态混音守护进程 audiod ----
+    //
+    // 链路：生产者 -> stream/0 -> audiod -> dsp -> intel-hda -> 硬件。
+    //
+    // **audiod 是 dsp 的写者，不是消费者，故不调 AUDIO_ATTACH**（实测修正，
+    // 见 audiod/src/main.rs 顶部说明）。它只需 dsp 上**已有**消费者——
+    // 那正是上面观测到的 `attached = true`（intel-hda 已占位）。
+    //
+    // 因此顺序上 audiod 必须排在 intel-hda **之后**（否则 dsp 无人消费，
+    // audiod 写入会被如实拒绝）。intel-hda 在 4.3.2 已拉起，此处满足。
     if !attached {
         // 如实说明为何不派生：没有消费者，生产者写了也会被拒。
         let _ = write(
@@ -725,9 +735,28 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
             b"[init] no audio consumer (no HDA device?); skipping stream producer (honest skip)\n",
         );
     } else {
+        // ---- 先起 audiod（混音中间层），再起生产者 ----
+        //
+        // M1 链路：生产者 -> stream/0 -> audiod -> dsp -> intel-hda -> 硬件。
+        // audiod 必须先 attach dsp，生产者写 dsp 才不会被拒。
+        match libsys::exec_path("/programs/audiod.elf", b"") {
+            Ok(pid) => {
+                let mut buf = [0u8; 8];
+                let _ = write(STDOUT, b"[init] audiod started (pid ");
+                let _ = write(STDOUT, dec_u64(pid, &mut buf));
+                let _ = write(STDOUT, b")\n");
+            }
+            Err(_) => {
+                let _ = write(STDOUT, b"[init] exec_path(audiod.elf) failed (non-fatal)\n");
+            }
+        }
+
         // 生产者写的是**确定性** pattern：这是 A3 数据通路验收的前提。
         // 若数据不确定，判据就只能退化成主观的"听起来有声音"。
-        match libsys::exec_path("/programs/audioe2e.elf", b"stream") {
+        // M1：生产者写 `stream/0`（经 audiod 转发到 dsp），而非直连 dsp。
+        // 参数：`stream <总字节数> <目标>`，目标 `stream0` 走混音链路。
+        // A3 的直连路径仍可用 `stream 524288 dsp` 复现（见 audioe2e 用法）。
+        match libsys::exec_path("/programs/audioe2e.elf", b"stream0") {
             Ok(pid) => {
                 let mut buf = [0u8; 8];
                 let _ = write(STDOUT, b"[init] audio stream producer started (pid ");

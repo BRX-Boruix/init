@@ -1,0 +1,17 @@
+M1: 拉起 audiod，生产者改走 stream/0（混音链路）
+
+链路：生产者 -> stream/0 -> audiod -> dsp -> intel-hda -> 硬件。
+
+**audiod 是 dsp 的写者，不是消费者，故不调 AUDIO_ATTACH**（实测修正，
+详见 audiod/src/main.rs 顶部说明）。它只需 dsp 上**已有**消费者——
+那正是启动时观测到的 attached=true（intel-hda 已占位）。
+
+故顺序上 audiod 必须排在 intel-hda **之后**：否则 dsp 无人消费，
+audiod 写入会被如实拒绝。intel-hda 在 4.3.2 已拉起，此处满足。
+
+（我先前在此处写的注释称"audiod 会取代 intel-hda"是**错的**：
+intel-hda 是常驻流式播放器、从不 detach，两者抢同一个槽必然死锁。
+已按实测更正。）
+
+生产者改为 `stream0` 模式（写 stream/0）。A3 的直连模式 `stream` 仍可用，
+两条路径都保留以便回归对照。
