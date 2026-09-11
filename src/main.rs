@@ -653,6 +653,32 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
         }
     }
 
+    // 4.3.3 A3：拉起**音频流生产者**，把已知 PCM 写进 /devices/audio/dsp。
+    //
+    // 时序：intel-hda 必须先完成 attach()（成为 ring 消费者），生产者的写入才
+    // 会被接受——无消费者时写入是**如实拒绝**（A1 的设计，不静默丢弃）。故此处
+    // 先让出若干轮给 intel-hda 完成认领/复位/枚举/attach/预填，再派生生产者。
+    //
+    // 生产者写的是**确定性** pattern，这是 A3 验收（WAV 逐字节比对）的前提：
+    // 若数据不确定，判据就只能退化成"听起来有声音"（主观、不可自动断言）。
+    //
+    // 非致命：无 HDA 设备时 intel-hda 已干净退出，生产者会因"无消费者"失败，
+    // 那是**如实反映**硬件缺失，不应阻断启动。
+    for _ in 0..3000 {
+        let _ = libsys::yield_now();
+    }
+    match libsys::exec_path("/programs/audioe2e.elf", b"stream") {
+        Ok(pid) => {
+            let mut buf = [0u8; 8];
+            let _ = write(STDOUT, b"[init] audio stream producer started (pid ");
+            let _ = write(STDOUT, dec_u64(pid, &mut buf));
+            let _ = write(STDOUT, b")\n");
+        }
+        Err(_) => {
+            let _ = write(STDOUT, b"[init] exec_path(audioe2e.elf stream) failed (non-fatal)\n");
+        }
+    }
+
     // 4.4 拉起阶段4 FP 演示进程 fpcheck（user-mode FP demo，会跑在 AP 上）。
     //    独立后台进程：真实 double 运算 + libc snprintf %.2f 输出，证明 AP 能跑
     //    用户态浮点/SSE 而无 #NM。RR 分发下它与 volumed/shell 轮流落各核。非致命。
