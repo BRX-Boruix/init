@@ -751,20 +751,38 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
             }
         }
 
-        // 生产者写的是**确定性** pattern：这是 A3 数据通路验收的前提。
+        // 生产者写的是**确定性** pattern：这是数据通路验收的前提。
         // 若数据不确定，判据就只能退化成主观的"听起来有声音"。
-        // M1：生产者写 `stream/0`（经 audiod 转发到 dsp），而非直连 dsp。
-        // 参数：`stream <总字节数> <目标>`，目标 `stream0` 走混音链路。
-        // A3 的直连路径仍可用 `stream 524288 dsp` 复现（见 audioe2e 用法）。
-        match libsys::exec_path("/programs/audioe2e.elf", b"stream0") {
-            Ok(pid) => {
-                let mut buf = [0u8; 8];
-                let _ = write(STDOUT, b"[init] audio stream producer started (pid ");
-                let _ = write(STDOUT, dec_u64(pid, &mut buf));
-                let _ = write(STDOUT, b")\n");
-            }
-            Err(_) => {
-                let _ = write(STDOUT, b"[init] exec_path(audioe2e.elf stream) failed (non-fatal)\n");
+        //
+        // 模式 token（单 token，因为内核参数块 ABI 恒 argc=1，不按空格切分）：
+        //   stream   -> 写 dsp       （A3 直连，可独立复现）
+        //   stream0  -> 写 stream/0  （混音第一路）
+        //   stream1  -> 写 stream/1  （混音第二路）
+        //
+        // M2 起同时拉起**两路**：只有两路都在写，才能验证混音器真的做了相加，
+        // 而不是把单路直通当成"混音成功"。
+        // M2 出口条件「一路断开不影响另一路」：第二路写**短**版本
+        // （stream1short，64 KiB 后退出），第一路持续写。
+        // audiod 侧应观察到 live_inputs 从 2 降到 1，且输出增益相应改变，
+        // 而 stream/0 的数据流本身完全不受影响。
+        // 元组两侧类型必须一致（模式是 &[u8;N]，标签是 &[u8;M]，长度不同则需显式切片）
+        let plan: [(&[u8], &[u8]); 2] = [
+            (b"stream0", b"stream/0"),
+            (b"stream1short", b"stream/1(short-lived)"),
+        ];
+        for (mode, label) in plan {
+            match libsys::exec_path("/programs/audioe2e.elf", mode) {
+                Ok(pid) => {
+                    let mut buf = [0u8; 8];
+                    let _ = write(STDOUT, b"[init] audio producer ");
+                    let _ = write(STDOUT, label);
+                    let _ = write(STDOUT, b" started (pid ");
+                    let _ = write(STDOUT, dec_u64(pid, &mut buf));
+                    let _ = write(STDOUT, b")\n");
+                }
+                Err(_) => {
+                    let _ = write(STDOUT, b"[init] exec_path(audioe2e.elf) failed (non-fatal)\n");
+                }
             }
         }
     }
