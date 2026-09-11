@@ -266,6 +266,26 @@ fn threaddemo_launch() {
 ///   3. consumer 醒来逐字节校验、commit、detach，退出 0。
 ///
 /// 失败不致命（非 fatal）：测试失败要**可见**，但不能让系统起不来。
+/// 等待音频消费者就位的有界重试轮数。
+///
+/// 取值依据：intel-hda 要完成"认领控制器 -> 复位 -> 枚举 codec -> R1 能力查询
+/// -> attach -> 预填"才置位 consumer。单次 `yield_now()` 会让出整个调度轮，
+/// 故几百轮足以覆盖，且不会像初版的 3000 那样拖上数分钟。
+/// 有界是刻意的：无 HDA 设备时**必须**能退出并如实跳过（S20 失败模式优先）。
+const AUDIO_ATTACH_WAIT_ROUNDS: u32 = 600;
+
+/// 朴素子串查找（在 `hay` 中找 `needle`）。
+///
+/// 不引 JSON 解析：这里只需判定 `/devices/audio/dsp/status` 里是否出现
+/// `"attached":true`。刻意保持最简——引入解析器会为一行判定增加大量代码与
+/// 失败面。若将来需要读更多字段，再引入真正的解析。
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return false;
+    }
+    (0..=hay.len() - needle.len()).any(|i| &hay[i..i + needle.len()] == needle)
+}
+
 fn audio_e2e_launch() {
     let _ = write(STDOUT, b"[init] launching audioe2e (A2 blocking round-trip)\n");
 
@@ -668,27 +688,55 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
 
     // 4.3.3 A3：拉起**音频流生产者**，把已知 PCM 写进 /devices/audio/dsp。
     //
-    // 时序：intel-hda 必须先完成 attach()（成为 ring 消费者），生产者的写入才
-    // 会被接受——无消费者时写入是**如实拒绝**（A1 的设计，不静默丢弃）。故此处
-    // 先让出若干轮给 intel-hda 完成认领/复位/枚举/attach/预填，再派生生产者。
+    // **必须等 intel-hda 完成 attach()**：写入路径要求 ring 已有消费者，
+    // 无消费者时写入是**如实拒绝**（A1 的设计，不静默丢弃）。
     //
-    // 生产者写的是**确定性** pattern，这是 A3 验收（WAV 逐字节比对）的前提：
-    // 若数据不确定，判据就只能退化成"听起来有声音"（主观、不可自动断言）。
+    // 【修正】初版这里写的是 `for _ in 0..3000 { yield_now() }` 作为"等一会儿"。
+    // 实测证明那是**错的**：`yield_now()` 是一次完整的调度往返，3000 次要跑
+    // 好几分钟（每次都要让给 volumed/driverd 等所有就绪线程），实测日志里
+    // 出现 16927 行 yield syscall、生产者迟迟不启动，A3 流式几乎没跑起来。
     //
-    // 非致命：无 HDA 设备时 intel-hda 已干净退出，生产者会因"无消费者"失败，
-    // 那是**如实反映**硬件缺失，不应阻断启动。
-    for _ in 0..3000 {
+    // 更根本的问题是：**延时不是同步**。它既不保证 intel-hda 已经 attach，
+    // 也不在它 attach 后立即继续——纯属猜一个数字（S13），且不可验证（S20）。
+    //
+    // 现在改为**观测真实前置条件**：轮询 `/devices/audio/dsp/status` 的
+    // `attached` 字段（A1 已如实披露该状态，S15 单一事实源），成立即派生。
+    // 有界重试：无 HDA 设备时 intel-hda 会干净退出，此时**如实报告并跳过**
+    // 生产者，而不是派生一个注定失败的进程。
+    let mut attached = false;
+    for _ in 0..AUDIO_ATTACH_WAIT_ROUNDS {
+        if let Ok(st) = libsys::read_to_end("/devices/audio/dsp/status") {
+            // 只做最朴素的子串判定：JSON 里 "attached":true 即表示消费者已就位。
+            if contains(&st, b"\"attached\":true") {
+                attached = true;
+                break;
+            }
+        }
         let _ = libsys::yield_now();
     }
-    match libsys::exec_path("/programs/audioe2e.elf", b"stream") {
-        Ok(pid) => {
-            let mut buf = [0u8; 8];
-            let _ = write(STDOUT, b"[init] audio stream producer started (pid ");
-            let _ = write(STDOUT, dec_u64(pid, &mut buf));
-            let _ = write(STDOUT, b")\n");
-        }
-        Err(_) => {
-            let _ = write(STDOUT, b"[init] exec_path(audioe2e.elf stream) failed (non-fatal)\n");
+    // 记录我们**实际观测到**的状态，而不是假定的状态（S09）。
+    let _ = write(STDOUT, b"[init] audio ring consumer attached = ");
+    let _ = write(STDOUT, if attached { b"true\n" } else { b"false\n" });
+
+    if !attached {
+        // 如实说明为何不派生：没有消费者，生产者写了也会被拒。
+        let _ = write(
+            STDOUT,
+            b"[init] no audio consumer (no HDA device?); skipping stream producer (honest skip)\n",
+        );
+    } else {
+        // 生产者写的是**确定性** pattern：这是 A3 数据通路验收的前提。
+        // 若数据不确定，判据就只能退化成主观的"听起来有声音"。
+        match libsys::exec_path("/programs/audioe2e.elf", b"stream") {
+            Ok(pid) => {
+                let mut buf = [0u8; 8];
+                let _ = write(STDOUT, b"[init] audio stream producer started (pid ");
+                let _ = write(STDOUT, dec_u64(pid, &mut buf));
+                let _ = write(STDOUT, b")\n");
+            }
+            Err(_) => {
+                let _ = write(STDOUT, b"[init] exec_path(audioe2e.elf stream) failed (non-fatal)\n");
+            }
         }
     }
 
