@@ -761,14 +761,21 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
         //
         // M2 起同时拉起**两路**：只有两路都在写，才能验证混音器真的做了相加，
         // 而不是把单路直通当成"混音成功"。
-        // M2 出口条件「一路断开不影响另一路」：第二路写**短**版本
-        // （stream1short，64 KiB 后退出），第一路持续写。
-        // audiod 侧应观察到 live_inputs 从 2 降到 1，且输出增益相应改变，
-        // 而 stream/0 的数据流本身完全不受影响。
-        // 元组两侧类型必须一致（模式是 &[u8;N]，标签是 &[u8;M]，长度不同则需显式切片）
+        // M4：两路都写**完整长度**，使整个观测窗口内两路都在供数。
+        //
+        // 先前用 `stream1short`（第二路 2 MiB 后退出）是为验证 M2 的
+        // 「一路断开不影响另一路」。但那样会给 M4 的音量观测引入歧义：
+        // 某次采样的幅度无法判断是"音量生效"还是"那一轮某路恰好无数据"。
+        // audiod 的轮次与 intel-hda 的 BCIS 轮次是两个独立计数器，日志里
+        // 无法对齐，故只能靠**让两路都持续供数**来消除歧义。
+        //
+        // M2 的断开场景已由 audiod 宿主测试与当时的实测日志证明，无需在
+        // 每次运行中重复（它正是 M4 观测的干扰源）。
+        //
+        // 元组两侧类型须一致（&[u8;N] 与 &[u8;M] 长度不同，需显式切片为 &[u8]）。
         let plan: [(&[u8], &[u8]); 2] = [
             (b"stream0", b"stream/0"),
-            (b"stream1short", b"stream/1(short-lived)"),
+            (b"stream1", b"stream/1"),
         ];
         for (mode, label) in plan {
             match libsys::exec_path("/programs/audioe2e.elf", mode) {
