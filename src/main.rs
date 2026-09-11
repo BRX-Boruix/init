@@ -251,6 +251,121 @@ fn threaddemo_launch() {
     }
 }
 
+
+/// A2：音频管道端到端**阻塞往返**测试（plan_audio_vfs.md 批次二）。
+///
+/// **为何放在 init 而非 shell 内建**：内核启动期测试（`test_audio_pipe_a2`）
+/// 直接调节点与 ring，触达不到两条关键路径——AUDIO 域 syscall 包装本身、
+/// 以及真正的阻塞-唤醒往返（`block_for_audio`/`wake_audio` 需要真实进程切换）。
+/// 而 shell 内建依赖 stdin，本环境的 stdin 是 PS/2 键盘（非串口），无法自动驱动。
+/// init 在启动时自动跑，使该验证成为**每次启动的常规回归**而非人工步骤。
+///
+/// **顺序是本测试的核心**（写反则等于什么都没验证）：
+///   1. 先派生 consumer —— 它 attach 后在**空** ring 上调 fetch，真正入睡；
+///   2. init 再经 VFS syscall 写入一帧 PCM —— 写路径的 notify 唤醒 consumer；
+///   3. consumer 醒来逐字节校验、commit、detach，退出 0。
+///
+/// 失败不致命（非 fatal）：测试失败要**可见**，但不能让系统起不来。
+fn audio_e2e_launch() {
+    let _ = write(STDOUT, b"[init] launching audioe2e (A2 blocking round-trip)\n");
+
+    // ---- 1. 先派生 consumer 并让它跑起来（attach + 在空 ring 上阻塞）----
+    let consumer = match libsys::exec_path("/programs/audioe2e.elf", b"consumer") {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = write(STDOUT, b"[init] audioe2e spawn failed (non-fatal)\n");
+            return;
+        }
+    };
+    let mut bbuf = [0u8; 8];
+    let _ = write(STDOUT, b"[init] audioe2e consumer pid ");
+    let _ = write(STDOUT, dec_u64(consumer, &mut bbuf));
+    let _ = write(STDOUT, b"\n");
+    // 让 consumer 跑到 fetch 并入睡。yield 保持 init 就绪（它若也阻塞，
+    // 无就绪同伴可切，consumer 的阻塞路径就走不到）。
+    for _ in 0..4000 {
+        let _ = yield_now();
+    }
+
+    // ---- 2. init 经 VFS syscall 写入一帧 PCM，唤醒阻塞的 consumer ----
+    // 填充必须与 audioe2e 的 consumer 端逐字节一致。
+    const FRAME: usize = 256;
+    let mut frame = [0u8; FRAME];
+    let mut i = 0usize;
+    while i < FRAME {
+        frame[i] = ((i * 37) ^ (i >> 3)) as u8;
+        i += 1;
+    }
+    let fd = match libsys::open(
+        "/devices/audio/dsp",
+        libsys::OpenFlags::READ_WRITE,
+        libsys::Permissions::read_write(),
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            let _ = write(STDOUT, b"[init] audioe2e open dsp failed (non-fatal)\n");
+            return;
+        }
+    };
+    match write(fd, &frame) {
+        Ok(n) if n == FRAME => {
+            let _ = write(
+                STDOUT,
+                b"[init] audioe2e wrote 256B frame (should have woken blocked reader)\n",
+            );
+        }
+        Ok(n) => {
+            let _ = write(STDOUT, b"[init] audioe2e SHORT write ");
+            let _ = write(STDOUT, dec_u64(n as u64, &mut bbuf));
+            let _ = write(STDOUT, b" (expected 256) - FAIL\n");
+        }
+        Err(_) => {
+            let _ = write(
+                STDOUT,
+                b"[init] audioe2e write FAILED (consumer not attached?)\n",
+            );
+        }
+    }
+    // 让被唤醒的 consumer 跑完校验/commit/detach。
+    for _ in 0..4000 {
+        let _ = yield_now();
+    }
+
+    // ---- 3. 收 consumer 退出码，断言 0 ----
+    let mut spins: u32 = 0;
+    loop {
+        match waitpid_any() {
+            Ok(wr) if wr.pid == consumer => {
+                if wr.code == 0 {
+                    let _ = write(
+                        STDOUT,
+                        b"[init] audioe2e PASS: blocked reader woke, verified, committed\n",
+                    );
+                } else {
+                    let _ = write(STDOUT, b"[init] audioe2e FAIL: consumer exit=");
+                    let _ = write(STDOUT, dec_u64(wr.code, &mut bbuf));
+                    let _ = write(STDOUT, b"\n");
+                }
+                break;
+            }
+            // 收到别的子进程（volumed/fpcheck 等），记录后继续等 consumer。
+            Ok(wr) => {
+                let _ = write(STDOUT, b"[init] audioe2e reaped other pid=");
+                let _ = write(STDOUT, dec_u64(wr.pid, &mut bbuf));
+                let _ = write(STDOUT, b" (continuing)\n");
+            }
+            Err(_) => {
+                spins += 1;
+                if spins > 20000 {
+                    let _ = write(STDOUT, b"[init] audioe2e reap timeout (giving up)\n");
+                    return;
+                }
+                let _ = yield_now();
+            }
+        }
+    }
+}
+
 /// T2-0：拉起 chelldemo（第一个真实 freestanding C 程序，x86-64 clang/lld 交叉链 +
 /// crt0 + 直连 syscall，不依赖 Rust libc）并收尸，验证 C 运行时地基端到端。
 /// chelldemo 立即打印并 exit(0)，故快速 poll 收尸即可；失败非致命。
@@ -568,6 +683,10 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
 
     // T2-5：真实 pthread 递归/join 基准（第三方惯用法）端到端。
     launch_c_prog("/programs/pthread_bench.elf", "pthread_bench");
+
+    // A2：音频管道端到端阻塞往返（plan_audio_vfs.md 批次二）。放在 C 程序之后，
+    // 避免与它们争抢调度时序，使阻塞-唤醒往返的观察更干净。
+    audio_e2e_launch();
 
     // 4.5 per-pid 锁化 + 跨核终止既有 bug 验证：跨核 spawn + SIGKILL terminate 风暴。
     cross_core_sigkill_storm();
