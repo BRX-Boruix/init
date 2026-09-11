@@ -608,6 +608,19 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
         let _ = write(STDOUT, &proc_bytes);
     }
 
+    // 4.2.5 A2：音频管道端到端阻塞往返（plan_audio_vfs.md 批次二）。
+    //
+    // **为什么必须放在 intel-hda 之前**（A3 实测发现的顺序约束）：
+    // A2 的测试方式是"一个进程 attach 成消费者并阻塞读取，另一个写一帧唤醒
+    // 它"。而 attach 的消费者槽位是**独占**的；intel-hda 在 A3 起流时也会
+    // attach 成消费者并**常驻不退**。若 A2 在 intel-hda 之后跑，它会拿到
+    // EBUSY 而失败——A3 初版正是如此（实测 `attach (consumer) rejected`，
+    // 随后 `audioe2e FAIL: consumer exit=1`）。
+    //
+    // 放在这里，两个测试**都**保持有效：先验证内核管道的阻塞/唤醒契约，
+    // 再由 A3 的流式栈接管消费者身份。二者语义不同，不该互相遮蔽。
+    audio_e2e_launch();
+
     // 4.3 拉起用户态卷管理守护进程 volumed（ADR-030 §决策1a / P2-1）。
     //    独立后台进程，经 VOLUME syscall + DEVICE 事件通道做卷自动挂载编排；
     //    不等待（守护进程自身永不退出）。启动失败不阻断 shell（非致命）。
@@ -710,9 +723,8 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     // T2-5：真实 pthread 递归/join 基准（第三方惯用法）端到端。
     launch_c_prog("/programs/pthread_bench.elf", "pthread_bench");
 
-    // A2：音频管道端到端阻塞往返（plan_audio_vfs.md 批次二）。放在 C 程序之后，
-    // 避免与它们争抢调度时序，使阻塞-唤醒往返的观察更干净。
-    audio_e2e_launch();
+    // A2 音频管道 e2e 已移至 4.2.5（**必须在 intel-hda 认领消费者槽之前**）。
+    // 此处不再调用：消费者槽位独占，迟跑必然 EBUSY。详见该处说明。
 
     // 4.5 per-pid 锁化 + 跨核终止既有 bug 验证：跨核 spawn + SIGKILL terminate 风暴。
     cross_core_sigkill_storm();
