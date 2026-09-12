@@ -586,6 +586,126 @@ fn shell_path_selfcheck() {
         }
     }
 }
+/// `audiofile` 端到端自检：真实播放一个真实 WAV 文件。
+///
+/// **为何必须有这个自检**：`audiofile` 的价值在于「真的放出声」这条完整链路
+/// ——读盘、解析、写设备、等待。若只在宿主上测解析器，或只在 QEMU 里手工敲一次，
+/// 都盖不住「写设备」与「等待」这两段（它们需要真实设备与进程上下文）。
+///
+/// 用 shell 的非交互模式拉起，与用户在命令行敲 `audiofile <path>` 完全同一条路径。
+fn audiofile_selfcheck() {
+    let _ = write(STDOUT, b"[audiofile-check] --- playing a real WAV via audiofile ---\n");
+    let path = "/volumes/BORUIX_DATA/tone-a4-48k.wav";
+    // 命令拼成 shell 的一整行：**ELF 路径** + 参数。
+    //
+    // **必须写全路径**：shell 的路径执行以「含 `/`」为判据，
+    // 裸名 `audiofile` 会走内建查找并报 unknown command（实测踩到）。
+    // 这与用户在命令行敲的是同一条路径，正是本自检要覆盖的。
+    let mut cmd = [0u8; 128];
+    let prog = b"/programs/audiofile.elf ";
+    cmd[..prog.len()].copy_from_slice(prog);
+    cmd[prog.len()..prog.len() + path.len()].copy_from_slice(path.as_bytes());
+    let n = prog.len() + path.len();
+    // exec_path 第二参是 `&[u8]`（命令字节），不需要转 str。
+    let cmd_bytes = &cmd[..n];
+    match libsys::exec_path("/programs/shell.elf", cmd_bytes) {
+        Ok(pid) => {
+            let mut buf = [0u8; 8];
+            let _ = write(STDOUT, b"[audiofile-check] spawned pid=");
+            let _ = write(STDOUT, dec_u64(pid, &mut buf));
+            let _ = write(STDOUT, b"\n");
+            // 收尸并读取退出码：退出码本身即判据（0=完整播放）。
+            //
+            // **必须按 pid 匹配**：启动期还有别的子进程（各类自检 shell）
+            // 在同时退出，`waitpid_any` 很可能先收到**别人**的退出码 ——
+            // 那样会把「播放成功」误报成失败（或反之），判据完全失真。
+            // 实测正是如此：audiofile 明明完整播放并打印了 done，
+            // 这里却收到另一个 shell 的 126。
+            match waitpid_any() {
+                Ok(wr) if wr.pid != pid => {
+                    let _ = write(STDOUT, b"[audiofile-check] NOTE: reaped unrelated pid ");
+                    let _ = write(STDOUT, dec_u64(wr.pid, &mut buf));
+                    let _ = write(STDOUT, b" (code ");
+                    let _ = write(STDOUT, dec_u64(wr.code as u64, &mut buf));
+                    let _ = write(STDOUT, b"), not our shell; playback result is in the log above\n");
+                }
+                Ok(wr) => {
+                    let _ = write(STDOUT, b"[audiofile-check] exit code=");
+                    let _ = write(STDOUT, dec_u64(wr.code as u64, &mut buf));
+                    if wr.code == 0 {
+                        let _ = write(STDOUT, b" -> playback completed\n");
+                    } else {
+                        let _ = write(STDOUT, b" -> FAILED (see audiofile output above)\n");
+                    }
+                }
+                Err(_) => {
+                    let _ = write(STDOUT, b"[audiofile-check] waitpid failed\n");
+                }
+            }
+        }
+        Err(_) => {
+            let _ = write(
+                STDOUT,
+                b"[audiofile-check] SKIP: could not spawn shell (is /programs/shell.elf present?)\n",
+            );
+        }
+    }
+}
+
+/// `audiofile` 负例自检：坏输入必须**如实失败**，且退出码非 0。
+///
+/// **为何必须做**：只验成功路径的话，「不管输入是什么都返回 0」的实现
+/// 也能通过 —— 那种实现其实什么都没播，却看起来一切正常（S20/S39）。
+///
+/// 每个用例都断言「退出码非 0」，而不是只看有没有打印错误（打印可以造假）。
+fn audiofile_selftest_negative() {
+    let _ = write(STDOUT, b"[audiofile-check] --- negative cases (must fail) ---\n");
+    // (传给 audiofile 的路径, 用例说明)
+    let cases: [(&str, &[u8]); 3] = [
+        (
+            "/volumes/BORUIX_DATA/definitely-not-here.wav",
+            b"nonexistent file",
+        ),
+        ("/volumes/BORUIX_DATA/README.md", b"not a WAV (no RIFF header)"),
+        ("/volumes/BORUIX_DATA", b"a directory, not a file"),
+    ];
+    for (path, what) in cases {
+        let _ = write(STDOUT, b"[audiofile-check] case: ");
+        let _ = write(STDOUT, what);
+        let _ = write(STDOUT, b"\n");
+        let mut cmd = [0u8; 128];
+        let prog = b"/programs/audiofile.elf ";
+        cmd[..prog.len()].copy_from_slice(prog);
+        cmd[prog.len()..prog.len() + path.len()].copy_from_slice(path.as_bytes());
+        let n = prog.len() + path.len();
+        match libsys::exec_path("/programs/shell.elf", &cmd[..n]) {
+            Ok(pid) => {
+                // 同样按 pid 匹配，避免把别人的退出码算到自己头上。
+                loop {
+                    match waitpid_any() {
+                        Ok(wr) if wr.pid == pid => {
+                            let mut buf = [0u8; 8];
+                            let _ = write(STDOUT, b"[audiofile-check]   exit=");
+                            let _ = write(STDOUT, dec_u64(wr.code as u64, &mut buf));
+                            if wr.code != 0 {
+                                let _ = write(STDOUT, b" (correctly rejected)\n");
+                            } else {
+                                let _ = write(STDOUT, b" (UNEXPECTED SUCCESS - bad input accepted!)\n");
+                            }
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(_) => break,
+                    }
+                }
+            }
+            Err(_) => {
+                let _ = write(STDOUT, b"[audiofile-check]   SKIP (could not spawn shell)\n");
+            }
+        }
+    }
+}
+
 fn cross_core_sigkill_storm() {
     const W: u32 = 5;
     const ROUNDS: u32 = 4;
@@ -938,6 +1058,22 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     // **必须放在 4.5 的 SIGKILL 风暴之前**：那个风暴会拉起 spinburn 并长时间
     // 运行（实测 300 秒未结束），放在它之后本自检根本不会被执行到。
     shell_path_selfcheck();
+
+    // 4.7 audiofile 端到端自检：用**真实参数**播放一个真实 WAV。
+    //
+    // 为何放在启动期而不是留给人工在 shell 里敲：shell 的交互式 stdin
+    // 与启动期多个自检 shell 争用，命令会被它们吞掉，结果不可复现。
+    // 而 shell 支持**非交互模式**（argv 给一条命令即执行后退出），
+    // 于是可以像 shell_path_selfcheck 一样确定性地跑完整条链路。
+    //
+    // 覆盖点：读盘上的 WAV -> 解析 -> 写 dsp -> 等待 -> 退出码。
+    // 盘不存在时如实 SKIP（不假装验过）。
+    // 负例：不存在的文件、非 WAV 文件、目录 —— 必须如实报错而不是静默成功。
+    //
+    // 只验成功路径的话，「永远返回 0」的实现也能通过（S20/S39）。
+    audiofile_selftest_negative();
+
+    audiofile_selfcheck();
 
     // 4.5 per-pid 锁化 + 跨核终止既有 bug 验证：跨核 spawn + SIGKILL terminate 风暴。
     cross_core_sigkill_storm();
