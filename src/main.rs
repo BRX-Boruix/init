@@ -656,6 +656,38 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     // 4.2.1 libc 最小链路自检（内核→libsys→libc→init 开机即通；防御式）。
     libc_selftest();
 
+    // 4.0 数据盘内容自检：证明 disk.img 的文件**真能被读出**，而不只是挂上了。
+    //
+    // 挂载成功只说明 EXT2 超级块可解析；内容是否正确取决于 SDK 写入路径
+    // （sdk/diskfiles -> mkimg -> disk.img）与内核读取路径是否真的对上。
+    // 二者中间的任一处出错，"挂载成功"都会照样打印。故此处实读一个文件。
+    //
+    // 盘可能不存在（未挂 -drive），故失败只如实记录，不阻断启动。
+    {
+        let _ = write(STDOUT, b"[init] probing data disk contents...\n");
+        let probe = "/volumes/BORUIX_DATA/welcome.txt";
+        match libsys::read_to_end(probe) {
+            Ok(bytes) => {
+                let _ = write(STDOUT, b"[init] read ");
+                let _ = write(STDOUT, probe.as_bytes());
+                let _ = write(STDOUT, b" (");
+                let mut nbuf = [0u8; 8];
+                let _ = write(STDOUT, dec_u64(bytes.len() as u64, &mut nbuf));
+                let _ = write(STDOUT, b" bytes), first line: ");
+                // 只打印首行，避免刷屏；同时足以证明内容来自 diskfiles 而非硬编码。
+                let end = bytes.iter().position(|&b| b == b'\n').unwrap_or(bytes.len());
+                let _ = write(STDOUT, &bytes[..end]);
+                let _ = write(STDOUT, b"\n");
+            }
+            Err(_) => {
+                let _ = write(
+                    STDOUT,
+                    b"[init] data disk not present or /volumes/BORUIX_DATA/welcome.txt missing (non-fatal)\n",
+                );
+            }
+        }
+    }
+
     // 4.1 验证用户态 VFS 系统调用（M6.2: open/write/read/seek/readdir/mkdir/read_to_end）。
     let _ = write(STDOUT, b"[init] testing userspace VFS syscalls...\n");
     let _ = libsys::mkdir("/config/init_test", libsys::Permissions::all());
