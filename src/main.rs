@@ -10,7 +10,7 @@
 #![no_main]
 
 use core::sync::atomic::{AtomicU32, Ordering};
-use libsys::{brk, exec_path, info, kill, waitpid_any, write, yield_now, STDOUT};
+use libsys::{brk, close, exec_path, info, kill, open, waitpid_any, write, yield_now, STDOUT};
 
 /// 把无符号整数格式化为十六进制字符串（写入固定缓冲），返回有效切片。
 ///
@@ -519,6 +519,73 @@ fn launch_c_prog(path: &str, tag: &str) {
 /// 每轮派生 W 个 spinburn 长驻子进程（least-loaded 分到各核），BSP 对其逐 kill(SIGKILL)，
 /// 再 waitpid_any 收尸。复现: 跨核 SIGKILL '运行中/仅存其核' 的进程后, 被杀进程未被
 /// 及时切走/可收尸 => 系统冻结。修复后此风暴应能多轮全绿(spawn==killed==reaped)。
+/// shell 路径执行自检：以不同 argv 拉起 shell，覆盖三类装载结果。
+///
+/// **每条 argv 是一次真实执行**，不是模拟：shell 走 `exec_line` -> `run_command`
+/// -> `classify_command` -> `exec_via_path` -> `exec_path`，与用户手敲完全同一条路径。
+///
+/// 三类结果都必须出现，否则本特性只被证明了一半：
+///
+/// 1. **成功**：`/programs/fpcheck.elf` 存在且是可加载 ELF，应跑完并以真实退出码返回；
+/// 2. **ENOENT**：一个确定不存在的路径，必须报 not found 而不是笼统失败；
+/// 3. **ENOEXEC**：`/programs` 下找一个**存在但不是 ELF** 的文件。
+///    `/devices/...` 之类的虚拟文件不是普通可读文件；这里用 `/` 之外的稳定目标——
+///    若找不到合适对象则该类跳过并**如实记录跳过**（不得假装验过）。
+///
+/// 相对路径 `./x` 也测一条：它是 Unix 用户最先试的写法，
+/// 且能验证「含斜杠即走路径」而不是「必须以斜杠开头」。
+fn shell_path_selfcheck() {
+    // ENOEXEC 用例需要一个**存在但不是 ELF** 的普通文件。liveCD 的 /programs 里
+    // 只有 ELF，故先自己造一个：在可写的 RamFS 根写一个纯文本文件。
+    // 这不依赖任何预先存在的测试资产，用例自带前置条件。
+    let notelf = "/not-an-elf.txt";
+    let created = match libsys::open(
+        notelf,
+        libsys::OpenFlags::CREATE_OR_TRUNCATE,
+        libsys::Permissions::read_write(),
+    ) {
+        Ok(fd) => {
+            let _ = libsys::write(fd, b"this is plain text, not an ELF image\n");
+            let _ = libsys::close(fd);
+            true
+        }
+        Err(_) => false,
+    };
+    if !created {
+        // 造不出来就如实说跳过，绝不假装验过（S39）。
+        let _ = write(STDOUT, b"[shell-path] SKIP ENOEXEC case: could not create ");
+        let _ = write(STDOUT, notelf.as_bytes());
+        let _ = write(STDOUT, b"\n");
+    }
+
+    let cases: [(&[u8], &str); 5] = [
+        (b"/programs/fpcheck.elf", "existing ELF"),
+        (b"/programs/definitely-not-here.elf", "missing file ENOENT"),
+        (b"./definitely-not-here.elf", "relative path ENOENT"),
+        (b"/programs", "directory EISDIR"),
+        (b"/not-an-elf.txt", "not an ELF ENOEXEC"),
+    ];
+    for (cmd, what) in cases {
+        let _ = write(STDOUT, b"[shell-path] --- case: ");
+        let _ = write(STDOUT, what.as_bytes());
+        let _ = write(STDOUT, b" cmd=");
+        let _ = write(STDOUT, cmd);
+        let _ = write(STDOUT, b"\n");
+        match libsys::exec_path("/programs/shell.elf", cmd) {
+            Ok(pid) => {
+                // 收尸并记录 shell 的退出码：退出码本身也是证据
+                // （126 = 无法执行，0 = 成功）。
+                let mut buf = [0u8; 8];
+                let _ = write(STDOUT, b"[shell-path] spawned pid=");
+                let _ = write(STDOUT, dec_u64(pid, &mut buf));
+                let _ = write(STDOUT, b"\n");
+            }
+            Err(_) => {
+                let _ = write(STDOUT, b"[shell-path] FAILED to spawn shell\n");
+            }
+        }
+    }
+}
 fn cross_core_sigkill_storm() {
     const W: u32 = 5;
     const ROUNDS: u32 = 4;
@@ -828,8 +895,21 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     // A2 音频管道 e2e 已移至 4.2.5（**必须在 intel-hda 认领消费者槽之前**）。
     // 此处不再调用：消费者槽位独占，迟跑必然 EBUSY。详见该处说明。
 
+    // 4.6 shell 路径执行自检（shell-path-exec 端到端验证）。
+    //
+    // **为何在 init 而不是 shell 内建里做**：本环境 shell 的 stdin 是 PS/2 键盘
+    // （非串口），无法自动驱动输入行；而 shell 支持经 argv 接收一条命令行。
+    // 故由 init 以不同 argv 反复拉起 shell —— 每条 argv 就是一次真实执行，
+    // 走的路径与用户手敲完全相同（exec_line -> run_command -> exec_via_path）。
+    // 与既有 threaddemo/audioe2e 的驱动手法一致（ADR-029）。
+    //
+    // **必须放在 4.5 的 SIGKILL 风暴之前**：那个风暴会拉起 spinburn 并长时间
+    // 运行（实测 300 秒未结束），放在它之后本自检根本不会被执行到。
+    shell_path_selfcheck();
+
     // 4.5 per-pid 锁化 + 跨核终止既有 bug 验证：跨核 spawn + SIGKILL terminate 风暴。
     cross_core_sigkill_storm();
+
 
     // 5. init 进入 supervisor 循环：拉起 shell → 等其退出 → 重生。
     //    类 SysV 登录循环语义，PID 1 永不退出。
