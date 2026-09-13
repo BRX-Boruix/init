@@ -579,6 +579,31 @@ fn shell_path_selfcheck() {
                 let _ = write(STDOUT, b"[shell-path] spawned pid=");
                 let _ = write(STDOUT, dec_u64(pid, &mut buf));
                 let _ = write(STDOUT, b"\n");
+                // **必须按 pid 收尸这个 shell**。
+                //
+                // 旧实现只 spawn 不收尸：5 个非交互 shell 全部滞留存活，每个都
+                // 阻塞在 `read(STDIN)` 上。监督循环随后又拉起真正的交互 shell，于是
+                // 多个 shell **并发读同一个键盘环形缓冲**，把一次击键瓜分给不同
+                // 进程（实测 `ls` → `lls`/`s`/`l`，`clear` → `llear`）——用户报的
+                // "命令对不对全靠运气"的直接成因。
+                //
+                // 按 pid 匹配（不用 WAIT_ANY），避免把别的子进程退出码算到本条。
+                loop {
+                    match waitpid_any() {
+                        Ok(wr) if wr.pid == pid => {
+                            let mut eb = [0u8; 8];
+                            let _ = write(STDOUT, b"[shell-path]   exit=");
+                            let _ = write(STDOUT, dec_u64(wr.code as u64, &mut eb));
+                            let _ = write(STDOUT, b"\n");
+                            break;
+                        }
+                        Ok(_) => continue, // 别人的退出码：继续等本 pid
+                        Err(_) => {
+                            // WouldBlock（本核暂无可切者）或瞬时失败：让出后重试。
+                            let _ = libsys::yield_now();
+                        }
+                    }
+                }
             }
             Err(_) => {
                 let _ = write(STDOUT, b"[shell-path] FAILED to spawn shell\n");
@@ -893,7 +918,10 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     // 4.3.2 拉起阶段三 intel-hda（ICH6 HD Audio）用户态声卡驱动带起。
     //    无 HDA 控制器（QEMU 未加 -device intel-hda）时驱动自查无设备并干净退出——
     //    非致命。加 -device intel-hda 后驱动认领/复位/枚举 codec（阶段三带起）。
-    match libsys::exec_path("/programs/intel-hda.elf", &[]) {
+    // `--quiet`：驱动本身默认会打 150 行 bring-up 取证（CORB/RIRB 轮询、
+            // codec 枚举、放大路由），足够淹没 shell 提示符。此处显式要求只留
+            // 结论行；需要逐步取证时去掉该参数单独跑驱动即可。
+            match libsys::exec_path("/programs/intel-hda.elf", b"--quiet") {
         Ok(pid) => {
             let mut buf = [0u8; 8];
             let _ = write(STDOUT, b"[init] intel-hda started (pid ");
@@ -1083,57 +1111,74 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     //    类 SysV 登录循环语义，PID 1 永不退出。
     //    也负责收尸被过继给 init 的孤儿进程，并区分日志。
     let _ = write(STDOUT, b"[init] entering supervisor loop\n");
-    let mut shell_pid: u64;
+    // supervisor：拉起 shell 一次，然后**只等**；只有确认 shell 本身已退出才重生。
+    //
+    // 旧实现把 `exec_path(shell)` 放在 `loop` 顶部。收尸分支无论走哪条路都要
+    // 回到循环顶再 exec 一遍 —— 于是**每收到一个被过继的孤儿就重开一个 shell**，
+    // 而原 shell 仍活着。多个 shell 并发 `read(STDIN)` 同一个键盘环形缓冲，
+    // 把一次击键瓜分给不同进程（实测 `ls` → `lls`/`s`/`l`，`clear` → `llear`，
+    // `cat not-an-elf.txt` → `t not-an-f.tt`）—— 用户报的「命令对不对全靠运气」。
+    //
+    // 结构纪律：`exec` 属于**重生**动作，必须在等待循环**之外**；等待循环内
+    // 只允许两类出口 —— 继续等（孤儿/瞬时失败）或跳出重生（shell 真死了）。
     loop {
-        match libsys::exec_path("/programs/shell.elf", &[]) {
-            Ok(pid) => {
-                shell_pid = pid;
-                let mut buf = [0u8; 8];
-                let _ = write(STDOUT, b"[init] shell started (pid ");
-                let _ = write(STDOUT, dec_u64(pid, &mut buf));
-                let _ = write(STDOUT, b")\n");
-            }
-            Err(_) => {
-                let _ = write(STDOUT, b"[init] exec_path(shell.elf) failed, retrying...\n");
-                // 启动失败时短眠再试（避免忙转），走 TASK_WAIT(0, 500ms)
-                let _ = libsys::sleep(500_000_000);
-                continue;
-            }
-        }
-        // 等任意子进程退出（shell 或被过继给 init 的孤儿）。
-        match waitpid_any() {
-            Ok(wr) => {
-                // 检查 shell 是否还活着：读 /processes/{shell_pid}/status。
-                // 若文件可读 → shell 还在，退出的是孤儿；
-                // 若 NotFound → shell 没了，需要重生。
-                let mut path_buf = [0u8; 32];
-                let prefix = b"/processes/";
-                let suffix = b"/status";
-                path_buf[..prefix.len()].copy_from_slice(prefix);
-                let mut pid_buf = [0u8; 8];
-                let pid_str = dec_u64(shell_pid, &mut pid_buf);
-                let start = prefix.len();
-                path_buf[start..start + pid_str.len()].copy_from_slice(pid_str);
-                let end = start + pid_str.len();
-                path_buf[end..end + suffix.len()].copy_from_slice(suffix);
-                let path = core::str::from_utf8(&path_buf[..end + suffix.len()])
-                    .unwrap_or("/processes/list");
-                if libsys::read_to_end(path).is_ok() {
-                    // shell 仍在运行 → 退出的是被过继给 init 的孤儿。
+        // ---- 重生点：只有走到这里才拉起新 shell ----
+        let shell_pid: u64 = loop {
+            match libsys::exec_path("/programs/shell.elf", &[]) {
+                Ok(pid) => {
                     let mut buf = [0u8; 8];
-                    let _ = write(STDOUT, b"[init] reaped orphan (code ");
-                    let _ = write(STDOUT, dec_u64(wr.code, &mut buf));
-                    let _ = write(STDOUT, b"), continuing\n");
-                } else {
-                    // shell 已退出 → 需要重生。
-                    let mut buf = [0u8; 8];
-                    let _ = write(STDOUT, b"[init] shell exited (code ");
-                    let _ = write(STDOUT, dec_u64(wr.code, &mut buf));
-                    let _ = write(STDOUT, b"), respawning\n");
+                    let _ = write(STDOUT, b"[init] shell started (pid ");
+                    let _ = write(STDOUT, dec_u64(pid, &mut buf));
+                    let _ = write(STDOUT, b")\n");
+                    break pid;
+                }
+                Err(_) => {
+                    let _ = write(STDOUT, b"[init] exec_path(shell.elf) failed, retrying...\n");
+                    // 启动失败时短眠再试（避免忙转），走 TASK_WAIT(0, 500ms)
+                    let _ = libsys::sleep(500_000_000);
                 }
             }
-            Err(_) => {
-                let _ = write(STDOUT, b"[init] waitpid_any() failed, retrying\n");
+        };
+        // ---- 等待循环：绝不再 exec ----
+        loop {
+            match waitpid_any() {
+                Ok(wr) => {
+                    // 判断退出的是 shell 还是被过继的孤儿：读
+                    // /processes/{shell_pid}/status。可读 → shell 还在；
+                    // NotFound → shell 已死，跳出本循环去重生。
+                    let mut path_buf = [0u8; 32];
+                    let prefix = b"/processes/";
+                    let suffix = b"/status";
+                    path_buf[..prefix.len()].copy_from_slice(prefix);
+                    let mut pid_buf = [0u8; 8];
+                    let pid_str = dec_u64(shell_pid, &mut pid_buf);
+                    let start = prefix.len();
+                    path_buf[start..start + pid_str.len()].copy_from_slice(pid_str);
+                    let end = start + pid_str.len();
+                    path_buf[end..end + suffix.len()].copy_from_slice(suffix);
+                    let path = core::str::from_utf8(&path_buf[..end + suffix.len()])
+                        .unwrap_or("/processes/list");
+                    if libsys::read_to_end(path).is_ok() {
+                        // shell 仍在运行 → 退出的是被过继给 init 的孤儿。
+                        // 继续等下一个，**绝不重生**。
+                        let mut buf = [0u8; 8];
+                        let _ = write(STDOUT, b"[init] reaped orphan (code ");
+                        let _ = write(STDOUT, dec_u64(wr.code, &mut buf));
+                        let _ = write(STDOUT, b"), continuing\n");
+                    } else {
+                        // shell 已退出 → 跳出等待循环，外层重生。
+                        let mut buf = [0u8; 8];
+                        let _ = write(STDOUT, b"[init] shell exited (code ");
+                        let _ = write(STDOUT, dec_u64(wr.code, &mut buf));
+                        let _ = write(STDOUT, b"), respawning\n");
+                        break;
+                    }
+                }
+                Err(_) => {
+                    // 等待失败（含 `WouldBlock`：本核暂无就绪者但子进程仍在跑）。
+                    // 让出后继续等，**绝不重生** —— 那正是并发 shell 抢键盘的成因。
+                    let _ = libsys::yield_now();
+                }
             }
         }
     }
