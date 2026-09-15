@@ -8,9 +8,11 @@
 
 #![no_std]
 #![no_main]
+// 临时允许：启动序列精简后，下列自检函数暂无调用点（即将迁往 `selftest` 命令的
+// 宿主程序）。迁移完成后删除本允许，恢复“死代码即错误”的纪律。
+#![allow(dead_code)]
 
-use core::sync::atomic::{AtomicU32, Ordering};
-use libsys::{brk, close, exec_path, info, kill, open, waitpid_any, write, yield_now, STDOUT};
+use libsys::{brk, info, waitpid_any, write, yield_now, STDOUT};
 
 /// 把无符号整数格式化为十六进制字符串（写入固定缓冲），返回有效切片。
 ///
@@ -41,216 +43,6 @@ fn print_hex(label: &[u8], v: u64) {
     let _ = write(STDOUT, s);
     let _ = write(STDOUT, b"\n");
 }
-
-// ---- ADR-034 S1-14：信号端到端自测（libsys action/raise + 用户 handler + sigreturn） ----
-
-/// 用户 SIGUSR1 handler 置位标记（供主流程验证 handler 确实被投递并 sigreturn 恢复）。
-static SIG_HANDLER_RAN: AtomicU32 = AtomicU32::new(0);
-
-/// naked handler：置位 `SIG_HANDLER_RAN` 后 `ret` → restorer → rt_sigreturn。
-/// 内核 `deliver_handler` 把 handler 返回地址写成 restorer 地址，`ret` 即跳 restorer。
-#[unsafe(naked)]
-unsafe extern "C" fn init_sigusr1_handler() {
-    core::arch::naked_asm!(
-        "mov dword ptr [rip + {ran}], 1",
-        "ret",
-        ran = sym SIG_HANDLER_RAN,
-    );
-}
-
-/// S1-14 自测：注册 SIGUSR1 handler → 向自身 raise → 返回用户态时投递进 handler
-/// → restorer → rt_sigreturn 恢复。任何失败打印错误但不中断后续启动（防御式）。
-fn signal_selftest() {
-    let _ = write(STDOUT, b"[init] signal: testing S1-14 action/raise/handler...\n");
-    let handler_addr = init_sigusr1_handler as *const () as usize as u64;
-    if let Err(_) = libsys::signal::action(libsys::signal::SIGUSR1, handler_addr, 0) {
-        let _ = write(STDOUT, b"[init] signal: action(SIGUSR1) failed\n");
-        return;
-    }
-    let _ = write(STDOUT, b"[init] signal: action(SIGUSR1, handler) ok\n");
-    // 向自身（init 恒为 PID 1）raise SIGUSR1。
-    match libsys::signal::raise(1, libsys::signal::SIGUSR1) {
-        Ok(_) => {}
-        Err(_) => {
-            let _ = write(STDOUT, b"[init] signal: raise(SIGUSR1) failed\n");
-            return;
-        }
-    }
-    let _ = write(STDOUT, b"[init] signal: raise ok, awaiting delivery...\n");
-    // 让出触发返回用户态投递（若 raise 返回时未投递，yield 再给一次机会）。
-    let _ = yield_now();
-    let _ = yield_now();
-    if SIG_HANDLER_RAN.load(Ordering::SeqCst) == 1 {
-        let _ = write(STDOUT, b"[init] signal: SIGUSR1 handler ran + sigreturn ok (S1-14 PASS)\n");
-    } else {
-        let _ = write(STDOUT, b"[init] signal: handler did NOT run (S1-14 FAIL)\n");
-    }
-}
-
-
-/// libc 最小链路自检（ADR 目标：内核→libsys→libc→init 在开机即通）。
-///
-/// 验证 libc 的核心 C ABI（malloc/string/printf/strtol/time），打印逐项
-/// OK/FAIL 与汇总。防御式：失败仅记录，不中断启动流程。
-fn libc_selftest() {
-    let _ = write(STDOUT, b"[init] libc: testing core C ABI...\n");
-    let mut pass = 0u32;
-    let mut fail = 0u32;
-
-    // 1) malloc/free 堆分配。
-    unsafe {
-        let p = libc::malloc::malloc(48);
-        if !p.is_null() {
-            *p.add(0) = 0x42;
-            *p.add(47) = 0x43;
-            if p.add(0).read() == 0x42 && p.add(47).read() == 0x43 {
-                pass += 1;
-                let _ = write(STDOUT, b"[init] libc: malloc/free OK\n");
-            } else {
-                fail += 1;
-                let _ = write(STDOUT, b"[init] libc: malloc writable FAIL\n");
-            }
-            libc::malloc::free(p);
-        } else {
-            fail += 1;
-            let _ = write(STDOUT, b"[init] libc: malloc FAIL\n");
-        }
-    }
-
-    // 2) string：strlen/strcmp。
-    unsafe {
-        let a = b"hello\0".as_ptr() as *const i8;
-        if libc::string::strlen(a) == 5 && libc::string::strcmp(a, b"hello\0".as_ptr() as *const i8) == 0 {
-            pass += 1;
-            let _ = write(STDOUT, b"[init] libc: string OK\n");
-        } else {
-            fail += 1;
-            let _ = write(STDOUT, b"[init] libc: string FAIL\n");
-        }
-    }
-
-    // 3) snprintf（格式引擎 + 浮点）。
-    unsafe {
-        let mut buf = [0u8; 64];
-        let n = libc::stdio::snprintf(
-            buf.as_mut_ptr() as *mut i8, buf.len(),
-            b"v=%d f=%.2f\0".as_ptr() as *const i8, 7, 3.14,
-        );
-        // 期望 "v=7 f=3.14"（长度 10）。
-        if n == 10 {
-            pass += 1;
-            let _ = write(STDOUT, b"[init] libc: snprintf OK\n");
-        } else {
-            fail += 1;
-            let _ = write(STDOUT, b"[init] libc: snprintf FAIL\n");
-        }
-    }
-
-    // 4) strtol 整数解析。
-    unsafe {
-        if libc::stdlib::strtol(b"-99\0".as_ptr() as *const i8, core::ptr::null_mut(), 10) == -99 {
-            pass += 1;
-            let _ = write(STDOUT, b"[init] libc: strtol OK\n");
-        } else {
-            fail += 1;
-            let _ = write(STDOUT, b"[init] libc: strtol FAIL\n");
-        }
-    }
-
-    // 5) time 墙钟读数。
-    {
-        if libc::time::time(core::ptr::null_mut()) > 0 {
-            pass += 1;
-            let _ = write(STDOUT, b"[init] libc: time OK\n");
-        } else {
-            fail += 1;
-            let _ = write(STDOUT, b"[init] libc: time FAIL\n");
-        }
-    }
-
-    // 汇总。
-    let _ = write(STDOUT, b"[init] libc: selftest passed=");
-    let mut b1 = [0u8; 8];
-    let pb = u64_to_dec(pass as u64, &mut b1);
-    let _ = write(STDOUT, pb);
-    let _ = write(STDOUT, b" failed=");
-    let mut b2 = [0u8; 8];
-    let fb = u64_to_dec(fail as u64, &mut b2);
-    let _ = write(STDOUT, fb);
-    let _ = write(STDOUT, b"\n");
-}
-
-/// 把 u64 写成十进制字节（最小，无前导零）。
-fn u64_to_dec(mut v: u64, buf: &mut [u8; 8]) -> &[u8] {
-    if v == 0 {
-        buf[0] = b'0';
-        return &buf[..1];
-    }
-    let mut i = buf.len();
-    while v > 0 {
-        i -= 1;
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
-    &buf[i..]
-}
-
-/// T1-8：拉起 threaddemo（端到端同进程双线程示例）并等待其完成、收尸。
-///
-/// 真实用户程序 /programs/threaddemo.elf 在自身进程内 thread_spawn 两个线程（共享
-/// 组长 Arc 地址空间、各自独立 mmap 用户栈）→ 各自打印 → thread_exit → 组长 join。
-/// init 以 exec_path 派生它并等 waitpid_any 收尸到其 pid。线程demo 秒级完成，故本
-/// 阶段其它长驻子进程（volumed/fpcheck）不会先退出。
-///
-/// SMP 语义：waitpid_any 在"本核此刻无其它就绪进程可接盘、无法阻塞"时会返回
-/// Err(WouldBlock/NotFound)——这**不是** threaddemo 已退/不存在，只是当前无法阻塞
-/// 等待。故用「yield 让出 + 重试 waitpid_any」轮询直到真正收尸到 threaddemo 的 pid：
-/// threaddemo 完成后留 zombie，随后的 waitpid_any 必能同步收尸。**绝不**在未收尸
-/// threaddemo 前就放行进入下一阶段（跨核风暴），以免风暴的跨核 SIGKILL 与仍在跑的
-/// threaddemo 线程并发触发调度竞争。
-fn threaddemo_launch() {
-    let _ = write(STDOUT, b"[init] launching threaddemo (T1-8 two-thread demo)\n");
-    let pid = match libsys::exec_path("/programs/threaddemo.elf", &[]) {
-        Ok(p) => p,
-        Err(_) => {
-            let _ = write(STDOUT, b"[init] exec_path(threaddemo.elf) failed (non-fatal)\n");
-            return;
-        }
-    };
-    let mut bbuf = [0u8; 8];
-    let _ = write(STDOUT, b"[init] threaddemo spawned (pid ");
-    let _ = write(STDOUT, dec_u64(pid, &mut bbuf));
-    let _ = write(STDOUT, b"), waiting for it to join both threads...\n");
-    // yield + waitpid_any 轮询，直到收尸 threaddemo 本体。Err（WouldBlock/NotFound）
-    // 表示当前核心此刻无法阻塞等待（非 threaddemo 已死），让出再试；上限 20000 次
-    // yield（约数秒）后仍未收到则记录并放行（防御式，理论上不达）。若意外收尸到
-    // volumed/fpcheck 等非 threaddemo 子进程，记录后继续等 threaddemo。
-    let mut spins: u32 = 0;
-    loop {
-        match waitpid_any() {
-            Ok(wr) if wr.pid == pid => {
-                let _ = write(STDOUT, b"[init] threaddemo reaped (code ");
-                let _ = write(STDOUT, dec_u64(wr.code, &mut bbuf));
-                let _ = write(STDOUT, b")\n");
-                break;
-            }
-            Ok(wr) => {
-                let _ = write(STDOUT, b"[init] waitpid_any reaped other child pid=");
-                let _ = write(STDOUT, dec_u64(wr.pid, &mut bbuf));
-                let _ = write(STDOUT, b" (continuing)\n");
-            }
-            Err(_) => {
-                spins += 1;
-                if spins > 20000 {
-                    let _ = write(STDOUT, b"[init] threaddemo reap timeout (giving up)\n");
-                    return;
-                }
-                let _ = yield_now();
-            }
-        }
-    }
-}
-
 
 /// A2：音频管道端到端**阻塞往返**测试（plan_audio_vfs.md 批次二）。
 ///
@@ -286,483 +78,6 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     (0..=hay.len() - needle.len()).any(|i| &hay[i..i + needle.len()] == needle)
 }
 
-fn audio_e2e_launch() {
-    let _ = write(STDOUT, b"[init] launching audioe2e (A2 blocking round-trip)\n");
-
-    // ---- 1. 先派生 consumer 并让它跑起来（attach + 在空 ring 上阻塞）----
-    let consumer = match libsys::exec_path("/programs/audioe2e.elf", b"consumer") {
-        Ok(p) => p,
-        Err(_) => {
-            let _ = write(STDOUT, b"[init] audioe2e spawn failed (non-fatal)\n");
-            return;
-        }
-    };
-    let mut bbuf = [0u8; 8];
-    let _ = write(STDOUT, b"[init] audioe2e consumer pid ");
-    let _ = write(STDOUT, dec_u64(consumer, &mut bbuf));
-    let _ = write(STDOUT, b"\n");
-    // 让 consumer 跑到 fetch 并入睡。yield 保持 init 就绪（它若也阻塞，
-    // 无就绪同伴可切，consumer 的阻塞路径就走不到）。
-    for _ in 0..4000 {
-        let _ = yield_now();
-    }
-
-    // ---- 2. init 经 VFS syscall 写入一帧 PCM，唤醒阻塞的 consumer ----
-    // 填充必须与 audioe2e 的 consumer 端逐字节一致。
-    const FRAME: usize = 256;
-    let mut frame = [0u8; FRAME];
-    let mut i = 0usize;
-    while i < FRAME {
-        frame[i] = ((i * 37) ^ (i >> 3)) as u8;
-        i += 1;
-    }
-    let fd = match libsys::open(
-        "/devices/audio/dsp",
-        libsys::OpenFlags::READ_WRITE,
-        libsys::Permissions::read_write(),
-    ) {
-        Ok(f) => f,
-        Err(_) => {
-            let _ = write(STDOUT, b"[init] audioe2e open dsp failed (non-fatal)\n");
-            return;
-        }
-    };
-    match write(fd, &frame) {
-        Ok(n) if n == FRAME => {
-            let _ = write(
-                STDOUT,
-                b"[init] audioe2e wrote 256B frame (should have woken blocked reader)\n",
-            );
-        }
-        Ok(n) => {
-            let _ = write(STDOUT, b"[init] audioe2e SHORT write ");
-            let _ = write(STDOUT, dec_u64(n as u64, &mut bbuf));
-            let _ = write(STDOUT, b" (expected 256) - FAIL\n");
-        }
-        Err(_) => {
-            let _ = write(
-                STDOUT,
-                b"[init] audioe2e write FAILED (consumer not attached?)\n",
-            );
-        }
-    }
-    // 让被唤醒的 consumer 跑完校验/commit/detach。
-    for _ in 0..4000 {
-        let _ = yield_now();
-    }
-
-    // ---- 3. 收 consumer 退出码，断言 0 ----
-    let mut spins: u32 = 0;
-    loop {
-        match waitpid_any() {
-            Ok(wr) if wr.pid == consumer => {
-                if wr.code == 0 {
-                    let _ = write(
-                        STDOUT,
-                        b"[init] audioe2e PASS: blocked reader woke, verified, committed\n",
-                    );
-                } else {
-                    let _ = write(STDOUT, b"[init] audioe2e FAIL: consumer exit=");
-                    let _ = write(STDOUT, dec_u64(wr.code, &mut bbuf));
-                    let _ = write(STDOUT, b"\n");
-                }
-                break;
-            }
-            // 收到别的子进程（volumed/fpcheck 等），记录后继续等 consumer。
-            Ok(wr) => {
-                let _ = write(STDOUT, b"[init] audioe2e reaped other pid=");
-                let _ = write(STDOUT, dec_u64(wr.pid, &mut bbuf));
-                let _ = write(STDOUT, b" (continuing)\n");
-            }
-            Err(_) => {
-                spins += 1;
-                if spins > 20000 {
-                    let _ = write(STDOUT, b"[init] audioe2e reap timeout (giving up)\n");
-                    return;
-                }
-                let _ = yield_now();
-            }
-        }
-    }
-}
-
-/// T2-0：拉起 chelldemo（第一个真实 freestanding C 程序，x86-64 clang/lld 交叉链 +
-/// crt0 + 直连 syscall，不依赖 Rust libc）并收尸，验证 C 运行时地基端到端。
-/// chelldemo 立即打印并 exit(0)，故快速 poll 收尸即可；失败非致命。
-fn chelldemo_launch() {
-    let _ = write(STDOUT, b"[init] launching chelldemo (T2-0 C runtime, freestanding clang)\n");
-    let pid = match libsys::exec_path("/programs/chelldemo.elf", &[]) {
-        Ok(p) => p,
-        Err(_) => { let _ = write(STDOUT, b"[init] exec_path(chelldemo.elf) failed (non-fatal)\n"); return; }
-    };
-    let mut bbuf = [0u8; 8];
-    let _ = write(STDOUT, b"[init] chelldemo spawned (pid ");
-    let _ = write(STDOUT, dec_u64(pid, &mut bbuf));
-    let _ = write(STDOUT, b")\n");
-    let mut spins: u32 = 0;
-    loop {
-        match waitpid_any() {
-            Ok(wr) if wr.pid == pid => {
-                let _ = write(STDOUT, b"[init] chelldemo reaped (code ");
-                let _ = write(STDOUT, dec_u64(wr.code, &mut bbuf));
-                let _ = write(STDOUT, b")\n");
-                break;
-            }
-            Ok(_) => {}
-            Err(_) => {
-                spins += 1;
-                if spins > 10000 { let _ = write(STDOUT, b"[init] chelldemo reap timeout\n"); return; }
-                let _ = yield_now();
-            }
-        }
-    }
-}
-/// T2-3：拉起 pthreaddemo（C pthread 生命周期端到端：create/join/detach/self）并收尸。
-/// 快速执行并 exit(0)；失败非致命。
-fn pthreaddemo_launch() {
-    let _ = write(STDOUT, b"[init] launching pthreaddemo (T2-3 C pthread lifecycle)\n");
-    let pid = match libsys::exec_path("/programs/pthreaddemo.elf", &[]) {
-        Ok(p) => p,
-        Err(_) => { let _ = write(STDOUT, b"[init] exec_path(pthreaddemo.elf) failed (non-fatal)\n"); return; }
-    };
-    let mut bbuf = [0u8; 8];
-    let _ = write(STDOUT, b"[init] pthreaddemo spawned (pid ");
-    let _ = write(STDOUT, dec_u64(pid, &mut bbuf));
-    let _ = write(STDOUT, b")\n");
-    let mut spins: u32 = 0;
-    loop {
-        match waitpid_any() {
-            Ok(wr) if wr.pid == pid => {
-                let _ = write(STDOUT, b"[init] pthreaddemo reaped (code ");
-                let _ = write(STDOUT, dec_u64(wr.code, &mut bbuf));
-                let _ = write(STDOUT, b")\n");
-                break;
-            }
-            Ok(_) => {}
-            Err(_) => {
-                spins += 1;
-                if spins > 20000 { let _ = write(STDOUT, b"[init] pthreaddemo reap timeout\n"); return; }
-                let _ = yield_now();
-            }
-        }
-    }
-}
-/// T2-4：拉起 pthread_syncdemo（C pthread 互斥/condvar/信号量端到端）并收尸。
-/// 快速执行并 exit(0)；失败非致命。
-fn pthread_syncdemo_launch() {
-    let _ = write(STDOUT, b"[init] launching pthread_syncdemo (T2-4 C mutex/cond/sem)\n");
-    let pid = match libsys::exec_path("/programs/pthread_syncdemo.elf", &[]) {
-        Ok(p) => p,
-        Err(_) => { let _ = write(STDOUT, b"[init] exec_path(pthread_syncdemo.elf) failed (non-fatal)\n"); return; }
-    };
-    let mut bbuf = [0u8; 8];
-    let _ = write(STDOUT, b"[init] pthread_syncdemo spawned (pid ");
-    let _ = write(STDOUT, dec_u64(pid, &mut bbuf));
-    let _ = write(STDOUT, b")\n");
-    let mut spins: u32 = 0;
-    loop {
-        match waitpid_any() {
-            Ok(wr) if wr.pid == pid => {
-                let _ = write(STDOUT, b"[init] pthread_syncdemo reaped (code ");
-                let _ = write(STDOUT, dec_u64(wr.code, &mut bbuf));
-                let _ = write(STDOUT, b")\n");
-                break;
-            }
-            Ok(_) => {}
-            Err(_) => {
-                spins += 1;
-                if spins > 40000 { let _ = write(STDOUT, b"[init] pthread_syncdemo reap timeout\n"); return; }
-                let _ = yield_now();
-            }
-        }
-    }
-}
-/// 通用 C 程序拉起 + 收尸：exec_path + waitpid_any 轮询，超时容忍。
-fn launch_c_prog(path: &str, tag: &str) {
-    let mut msg = [0u8; 96];
-    let mut n = 0;
-    for b in b"[init] launching ".iter() { msg[n] = *b; n += 1; }
-    for b in tag.bytes() { msg[n] = b; n += 1; }
-    for b in b"\n".iter() { msg[n] = *b; n += 1; }
-    let _ = write(STDOUT, &msg[..n]);
-    let pid = match libsys::exec_path(path, &[]) {
-        Ok(pp) => pp,
-        Err(_) => {
-            let _ = write(STDOUT, b"[init] exec_path failed (non-fatal)\n");
-            return;
-        }
-    };
-    let mut spins: u32 = 0;
-    loop {
-        match waitpid_any() {
-            Ok(wr) if wr.pid == pid => {
-                let mut rp = [0u8; 8];
-                let _ = write(STDOUT, b"[init] ");
-                let _ = write(STDOUT, tag.as_bytes());
-                let _ = write(STDOUT, b" reaped (code ");
-                let _ = write(STDOUT, dec_u64(wr.code, &mut rp));
-                let _ = write(STDOUT, b")\n");
-                return;
-            }
-            Ok(_) => {}
-            Err(_) => {
-                spins += 1;
-                if spins > 80000 { let _ = write(STDOUT, b"[init] reap timeout\n"); return; }
-                let _ = yield_now();
-            }
-        }
-    }
-}
-
-/// 跨核 spawn + SIGKILL terminate 风暴（S1 迁移 + 既有跨核终止 bug 的复现/回归脚手架）。
-///
-/// 每轮派生 W 个 spinburn 长驻子进程（least-loaded 分到各核），BSP 对其逐 kill(SIGKILL)，
-/// 再 waitpid_any 收尸。复现: 跨核 SIGKILL '运行中/仅存其核' 的进程后, 被杀进程未被
-/// 及时切走/可收尸 => 系统冻结。修复后此风暴应能多轮全绿(spawn==killed==reaped)。
-/// shell 路径执行自检：以不同 argv 拉起 shell，覆盖三类装载结果。
-///
-/// **每条 argv 是一次真实执行**，不是模拟：shell 走 `exec_line` -> `run_command`
-/// -> `classify_command` -> `exec_via_path` -> `exec_path`，与用户手敲完全同一条路径。
-///
-/// 三类结果都必须出现，否则本特性只被证明了一半：
-///
-/// 1. **成功**：`/programs/fpcheck.elf` 存在且是可加载 ELF，应跑完并以真实退出码返回；
-/// 2. **ENOENT**：一个确定不存在的路径，必须报 not found 而不是笼统失败；
-/// 3. **ENOEXEC**：`/programs` 下找一个**存在但不是 ELF** 的文件。
-///    `/devices/...` 之类的虚拟文件不是普通可读文件；这里用 `/` 之外的稳定目标——
-///    若找不到合适对象则该类跳过并**如实记录跳过**（不得假装验过）。
-///
-/// 相对路径 `./x` 也测一条：它是 Unix 用户最先试的写法，
-/// 且能验证「含斜杠即走路径」而不是「必须以斜杠开头」。
-fn shell_path_selfcheck() {
-    // ENOEXEC 用例需要一个**存在但不是 ELF** 的普通文件。liveCD 的 /programs 里
-    // 只有 ELF，故先自己造一个：在可写的 RamFS 根写一个纯文本文件。
-    // 这不依赖任何预先存在的测试资产，用例自带前置条件。
-    let notelf = "/not-an-elf.txt";
-    let created = match libsys::open(
-        notelf,
-        libsys::OpenFlags::CREATE_OR_TRUNCATE,
-        libsys::Permissions::read_write(),
-    ) {
-        Ok(fd) => {
-            let _ = libsys::write(fd, b"this is plain text, not an ELF image\n");
-            let _ = libsys::close(fd);
-            true
-        }
-        Err(_) => false,
-    };
-    if !created {
-        // 造不出来就如实说跳过，绝不假装验过（S39）。
-        let _ = write(STDOUT, b"[shell-path] SKIP ENOEXEC case: could not create ");
-        let _ = write(STDOUT, notelf.as_bytes());
-        let _ = write(STDOUT, b"\n");
-    }
-
-    let cases: [(&[u8], &str); 5] = [
-        (b"/programs/fpcheck.elf", "existing ELF"),
-        (b"/programs/definitely-not-here.elf", "missing file ENOENT"),
-        (b"./definitely-not-here.elf", "relative path ENOENT"),
-        (b"/programs", "directory EISDIR"),
-        (b"/not-an-elf.txt", "not an ELF ENOEXEC"),
-    ];
-    for (cmd, what) in cases {
-        let _ = write(STDOUT, b"[shell-path] --- case: ");
-        let _ = write(STDOUT, what.as_bytes());
-        let _ = write(STDOUT, b" cmd=");
-        let _ = write(STDOUT, cmd);
-        let _ = write(STDOUT, b"\n");
-        match libsys::exec_path("/programs/shell.elf", cmd) {
-            Ok(pid) => {
-                // 收尸并记录 shell 的退出码：退出码本身也是证据
-                // （126 = 无法执行，0 = 成功）。
-                let mut buf = [0u8; 8];
-                let _ = write(STDOUT, b"[shell-path] spawned pid=");
-                let _ = write(STDOUT, dec_u64(pid, &mut buf));
-                let _ = write(STDOUT, b"\n");
-                // **必须按 pid 收尸这个 shell**。
-                //
-                // 旧实现只 spawn 不收尸：5 个非交互 shell 全部滞留存活，每个都
-                // 阻塞在 `read(STDIN)` 上。监督循环随后又拉起真正的交互 shell，于是
-                // 多个 shell **并发读同一个键盘环形缓冲**，把一次击键瓜分给不同
-                // 进程（实测 `ls` → `lls`/`s`/`l`，`clear` → `llear`）——用户报的
-                // "命令对不对全靠运气"的直接成因。
-                //
-                // 按 pid 匹配（不用 WAIT_ANY），避免把别的子进程退出码算到本条。
-                loop {
-                    match waitpid_any() {
-                        Ok(wr) if wr.pid == pid => {
-                            let mut eb = [0u8; 8];
-                            let _ = write(STDOUT, b"[shell-path]   exit=");
-                            let _ = write(STDOUT, dec_u64(wr.code as u64, &mut eb));
-                            let _ = write(STDOUT, b"\n");
-                            break;
-                        }
-                        Ok(_) => continue, // 别人的退出码：继续等本 pid
-                        Err(_) => {
-                            // WouldBlock（本核暂无可切者）或瞬时失败：让出后重试。
-                            let _ = libsys::yield_now();
-                        }
-                    }
-                }
-            }
-            Err(_) => {
-                let _ = write(STDOUT, b"[shell-path] FAILED to spawn shell\n");
-            }
-        }
-    }
-}
-/// `audiofile` 端到端自检：真实播放一个真实 WAV 文件。
-///
-/// **为何必须有这个自检**：`audiofile` 的价值在于「真的放出声」这条完整链路
-/// ——读盘、解析、写设备、等待。若只在宿主上测解析器，或只在 QEMU 里手工敲一次，
-/// 都盖不住「写设备」与「等待」这两段（它们需要真实设备与进程上下文）。
-///
-/// 用 shell 的非交互模式拉起，与用户在命令行敲 `audiofile <path>` 完全同一条路径。
-fn audiofile_selfcheck() {
-    let _ = write(STDOUT, b"[audiofile-check] --- playing a real WAV via audiofile ---\n");
-    let path = "/volumes/BORUIX_DATA/tone-a4-48k.wav";
-    // 命令拼成 shell 的一整行：**ELF 路径** + 参数。
-    //
-    // **必须写全路径**：shell 的路径执行以「含 `/`」为判据，
-    // 裸名 `audiofile` 会走内建查找并报 unknown command（实测踩到）。
-    // 这与用户在命令行敲的是同一条路径，正是本自检要覆盖的。
-    let mut cmd = [0u8; 128];
-    let prog = b"/programs/audiofile.elf ";
-    cmd[..prog.len()].copy_from_slice(prog);
-    cmd[prog.len()..prog.len() + path.len()].copy_from_slice(path.as_bytes());
-    let n = prog.len() + path.len();
-    // exec_path 第二参是 `&[u8]`（命令字节），不需要转 str。
-    let cmd_bytes = &cmd[..n];
-    match libsys::exec_path("/programs/shell.elf", cmd_bytes) {
-        Ok(pid) => {
-            let mut buf = [0u8; 8];
-            let _ = write(STDOUT, b"[audiofile-check] spawned pid=");
-            let _ = write(STDOUT, dec_u64(pid, &mut buf));
-            let _ = write(STDOUT, b"\n");
-            // 收尸并读取退出码：退出码本身即判据（0=完整播放）。
-            //
-            // **必须按 pid 匹配**：启动期还有别的子进程（各类自检 shell）
-            // 在同时退出，`waitpid_any` 很可能先收到**别人**的退出码 ——
-            // 那样会把「播放成功」误报成失败（或反之），判据完全失真。
-            // 实测正是如此：audiofile 明明完整播放并打印了 done，
-            // 这里却收到另一个 shell 的 126。
-            match waitpid_any() {
-                Ok(wr) if wr.pid != pid => {
-                    let _ = write(STDOUT, b"[audiofile-check] NOTE: reaped unrelated pid ");
-                    let _ = write(STDOUT, dec_u64(wr.pid, &mut buf));
-                    let _ = write(STDOUT, b" (code ");
-                    let _ = write(STDOUT, dec_u64(wr.code as u64, &mut buf));
-                    let _ = write(STDOUT, b"), not our shell; playback result is in the log above\n");
-                }
-                Ok(wr) => {
-                    let _ = write(STDOUT, b"[audiofile-check] exit code=");
-                    let _ = write(STDOUT, dec_u64(wr.code as u64, &mut buf));
-                    if wr.code == 0 {
-                        let _ = write(STDOUT, b" -> playback completed\n");
-                    } else {
-                        let _ = write(STDOUT, b" -> FAILED (see audiofile output above)\n");
-                    }
-                }
-                Err(_) => {
-                    let _ = write(STDOUT, b"[audiofile-check] waitpid failed\n");
-                }
-            }
-        }
-        Err(_) => {
-            let _ = write(
-                STDOUT,
-                b"[audiofile-check] SKIP: could not spawn shell (is /programs/shell.elf present?)\n",
-            );
-        }
-    }
-}
-
-/// `audiofile` 负例自检：坏输入必须**如实失败**，且退出码非 0。
-///
-/// **为何必须做**：只验成功路径的话，「不管输入是什么都返回 0」的实现
-/// 也能通过 —— 那种实现其实什么都没播，却看起来一切正常（S20/S39）。
-///
-/// 每个用例都断言「退出码非 0」，而不是只看有没有打印错误（打印可以造假）。
-fn audiofile_selftest_negative() {
-    let _ = write(STDOUT, b"[audiofile-check] --- negative cases (must fail) ---\n");
-    // (传给 audiofile 的路径, 用例说明)
-    let cases: [(&str, &[u8]); 3] = [
-        (
-            "/volumes/BORUIX_DATA/definitely-not-here.wav",
-            b"nonexistent file",
-        ),
-        ("/volumes/BORUIX_DATA/README.md", b"not a WAV (no RIFF header)"),
-        ("/volumes/BORUIX_DATA", b"a directory, not a file"),
-    ];
-    for (path, what) in cases {
-        let _ = write(STDOUT, b"[audiofile-check] case: ");
-        let _ = write(STDOUT, what);
-        let _ = write(STDOUT, b"\n");
-        let mut cmd = [0u8; 128];
-        let prog = b"/programs/audiofile.elf ";
-        cmd[..prog.len()].copy_from_slice(prog);
-        cmd[prog.len()..prog.len() + path.len()].copy_from_slice(path.as_bytes());
-        let n = prog.len() + path.len();
-        match libsys::exec_path("/programs/shell.elf", &cmd[..n]) {
-            Ok(pid) => {
-                // 同样按 pid 匹配，避免把别人的退出码算到自己头上。
-                loop {
-                    match waitpid_any() {
-                        Ok(wr) if wr.pid == pid => {
-                            let mut buf = [0u8; 8];
-                            let _ = write(STDOUT, b"[audiofile-check]   exit=");
-                            let _ = write(STDOUT, dec_u64(wr.code as u64, &mut buf));
-                            if wr.code != 0 {
-                                let _ = write(STDOUT, b" (correctly rejected)\n");
-                            } else {
-                                let _ = write(STDOUT, b" (UNEXPECTED SUCCESS - bad input accepted!)\n");
-                            }
-                            break;
-                        }
-                        Ok(_) => continue,
-                        Err(_) => break,
-                    }
-                }
-            }
-            Err(_) => {
-                let _ = write(STDOUT, b"[audiofile-check]   SKIP (could not spawn shell)\n");
-            }
-        }
-    }
-}
-
-fn cross_core_sigkill_storm() {
-    const W: u32 = 5;
-    const ROUNDS: u32 = 4;
-    let _ = write(STDOUT, b"[init] cross-core SIGKILL storm: start\n");
-    let mut rbuf = [0u8; 8];
-    for round in 0..ROUNDS {
-        let mut pids = [0u64; 8];
-        let mut n = 0u32;
-        for _ in 0..W {
-            if let Ok(p) = exec_path("/programs/spinburn.elf", &[]) {
-                if (n as usize) < pids.len() { pids[n as usize] = p; n += 1; }
-            }
-            for _ in 0..100 { let _ = yield_now(); }
-        }
-        if n == 0 { continue; }
-        for _ in 0..2500 { let _ = yield_now(); }
-        let mut killed = 0u32;
-        for i in 0..n { if kill(pids[i as usize], 9).is_ok() { killed += 1; } }
-        let mut reaped = 0u32;
-        for _ in 0..n {
-            match waitpid_any() { Ok(_) => { reaped += 1; } Err(_) => { break; } }
-        }
-        let _ = write(STDOUT, b"[init] storm round ");
-        let _ = write(STDOUT, dec_u64(round as u64, &mut rbuf));
-        let _ = write(STDOUT, b": spawn="); let _ = write(STDOUT, dec_u64(n as u64, &mut rbuf));
-        let _ = write(STDOUT, b" killed="); let _ = write(STDOUT, dec_u64(killed as u64, &mut rbuf));
-        let _ = write(STDOUT, b" reaped="); let _ = write(STDOUT, dec_u64(reaped as u64, &mut rbuf));
-        let _ = write(STDOUT, b"\n");
-    }
-    let _ = write(STDOUT, b"[init] cross-core SIGKILL storm done\n");
-}
-
 /// init 主流程：打印信息、查询内核版本与堆断点、退出。
 #[unsafe(no_mangle)]
 pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
@@ -795,11 +110,7 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
         }
     }
 
-    // 4.2 ADR-034 S1-14：信号端到端自测（防御式，失败不中断启动）。
-    signal_selftest();
-
-    // 4.2.1 libc 最小链路自检（内核→libsys→libc→init 开机即通；防御式）。
-    libc_selftest();
+    // 信号/libc 自检已移入 `selftest` 命令（用户要求开机直达 shell；按需运行）。
 
     // 4.0 数据盘内容自检：证明 disk.img 的文件**真能被读出**，而不只是挂上了。
     //
@@ -872,18 +183,10 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
         let _ = write(STDOUT, &proc_bytes);
     }
 
-    // 4.2.5 A2：音频管道端到端阻塞往返（plan_audio_vfs.md 批次二）。
-    //
-    // **为什么必须放在 intel-hda 之前**（A3 实测发现的顺序约束）：
-    // A2 的测试方式是"一个进程 attach 成消费者并阻塞读取，另一个写一帧唤醒
-    // 它"。而 attach 的消费者槽位是**独占**的；intel-hda 在 A3 起流时也会
-    // attach 成消费者并**常驻不退**。若 A2 在 intel-hda 之后跑，它会拿到
-    // EBUSY 而失败——A3 初版正是如此（实测 `attach (consumer) rejected`，
-    // 随后 `audioe2e FAIL: consumer exit=1`）。
-    //
-    // 放在这里，两个测试**都**保持有效：先验证内核管道的阻塞/唤醒契约，
-    // 再由 A3 的流式栈接管消费者身份。二者语义不同，不该互相遮蔽。
-    audio_e2e_launch();
+    // 4.2.5 A2 音频管道阻塞往返自检已移入 `selftest` 命令（开机直达 shell）。
+    // 注意：`selftest` 里跑 A2 必须在 intel-hda attach **之前**才有消费者槽
+    // 可用（槽位独占）；shell 里跑时 intel-hda 常驻占槽，A2 会如实报 EBUSY——
+    // 这是真实约束，不是回归。
 
     // 4.3 拉起用户态卷管理守护进程 volumed（ADR-030 §决策1a / P2-1）。
     //    独立后台进程，经 VOLUME syscall + DEVICE 事件通道做卷自动挂载编排；
@@ -965,27 +268,26 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     let _ = write(STDOUT, b"[init] audio ring consumer attached = ");
     let _ = write(STDOUT, if attached { b"true\n" } else { b"false\n" });
 
-    // ---- 4.3.3.1 批次四 M1：拉起用户态混音守护进程 audiod ----
-    //
-    // 链路：生产者 -> stream/0 -> audiod -> dsp -> intel-hda -> 硬件。
+    // ---- 4.3.3.1 拉起混音守护进程 audiod（守护进程，保留常驻）----
     //
     // **audiod 是 dsp 的写者，不是消费者，故不调 AUDIO_ATTACH**（实测修正，
     // 见 audiod/src/main.rs 顶部说明）。它只需 dsp 上**已有**消费者——
-    // 那正是上面观测到的 `attached = true`（intel-hda 已占位）。
+    // 即 intel-hda 已 attach 占位。
     //
-    // 因此顺序上 audiod 必须排在 intel-hda **之后**（否则 dsp 无人消费，
-    // audiod 写入会被如实拒绝）。intel-hda 在 4.3.2 已拉起，此处满足。
+    // 顺序约束：audiod 必须排在 intel-hda **之后**（否则 dsp 无人消费，
+    // audiod 写入会被如实拒绝）。
+    //
+    // 原 8 MiB x2 路 stream 生产者与 fpcheck 已移入 `selftest` 命令：
+    // 它们是**有界的测试负载**（2 x 44s 实时播放 + FP 演示），不是服务——
+    // 开机必跑会让 shell 迟到两三分钟（用户实测）。audiod 只 attach/待命，
+    // 不产生声音，留在开机序列里没有代价。
     if !attached {
-        // 如实说明为何不派生：没有消费者，生产者写了也会被拒。
+        // 如实说明：没有消费者时 audiod 的写入会被拒，跳过派生（honest skip）。
         let _ = write(
             STDOUT,
-            b"[init] no audio consumer (no HDA device?); skipping stream producer (honest skip)\n",
+            b"[init] no audio consumer (no HDA device?); skipping audiod (honest skip)\n",
         );
     } else {
-        // ---- 先起 audiod（混音中间层），再起生产者 ----
-        //
-        // M1 链路：生产者 -> stream/0 -> audiod -> dsp -> intel-hda -> 硬件。
-        // audiod 必须先 attach dsp，生产者写 dsp 才不会被拒。
         match libsys::exec_path("/programs/audiod.elf", b"") {
             Ok(pid) => {
                 let mut buf = [0u8; 8];
@@ -997,80 +299,12 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
                 let _ = write(STDOUT, b"[init] exec_path(audiod.elf) failed (non-fatal)\n");
             }
         }
-
-        // 生产者写的是**确定性** pattern：这是数据通路验收的前提。
-        // 若数据不确定，判据就只能退化成主观的"听起来有声音"。
-        //
-        // 模式 token（单 token，因为内核参数块 ABI 恒 argc=1，不按空格切分）：
-        //   stream   -> 写 dsp       （A3 直连，可独立复现）
-        //   stream0  -> 写 stream/0  （混音第一路）
-        //   stream1  -> 写 stream/1  （混音第二路）
-        //
-        // M2 起同时拉起**两路**：只有两路都在写，才能验证混音器真的做了相加，
-        // 而不是把单路直通当成"混音成功"。
-        // M4：两路都写**完整长度**，使整个观测窗口内两路都在供数。
-        //
-        // 先前用 `stream1short`（第二路 2 MiB 后退出）是为验证 M2 的
-        // 「一路断开不影响另一路」。但那样会给 M4 的音量观测引入歧义：
-        // 某次采样的幅度无法判断是"音量生效"还是"那一轮某路恰好无数据"。
-        // audiod 的轮次与 intel-hda 的 BCIS 轮次是两个独立计数器，日志里
-        // 无法对齐，故只能靠**让两路都持续供数**来消除歧义。
-        //
-        // M2 的断开场景已由 audiod 宿主测试与当时的实测日志证明，无需在
-        // 每次运行中重复（它正是 M4 观测的干扰源）。
-        //
-        // 元组两侧类型须一致（&[u8;N] 与 &[u8;M] 长度不同，需显式切片为 &[u8]）。
-        let plan: [(&[u8], &[u8]); 2] = [
-            (b"stream0", b"stream/0"),
-            (b"stream1", b"stream/1"),
-        ];
-        for (mode, label) in plan {
-            match libsys::exec_path("/programs/audioe2e.elf", mode) {
-                Ok(pid) => {
-                    let mut buf = [0u8; 8];
-                    let _ = write(STDOUT, b"[init] audio producer ");
-                    let _ = write(STDOUT, label);
-                    let _ = write(STDOUT, b" started (pid ");
-                    let _ = write(STDOUT, dec_u64(pid, &mut buf));
-                    let _ = write(STDOUT, b")\n");
-                }
-                Err(_) => {
-                    let _ = write(STDOUT, b"[init] exec_path(audioe2e.elf) failed (non-fatal)\n");
-                }
-            }
-        }
-    }
-
-    // 4.4 拉起阶段4 FP 演示进程 fpcheck（user-mode FP demo，会跑在 AP 上）。
-    //    独立后台进程：真实 double 运算 + libc snprintf %.2f 输出，证明 AP 能跑
-    //    用户态浮点/SSE 而无 #NM。RR 分发下它与 volumed/shell 轮流落各核。非致命。
-    match libsys::exec_path("/programs/fpcheck.elf", &[]) {
-        Ok(pid) => {
-            let mut buf = [0u8; 8];
-            let _ = write(STDOUT, b"[init] fpcheck started (pid ");
-            let _ = write(STDOUT, dec_u64(pid, &mut buf));
-            let _ = write(STDOUT, b")\n");
-        }
-        Err(_) => {
-            let _ = write(STDOUT, b"[init] exec_path(fpcheck.elf) failed (non-fatal)\n");
-        }
     }
 
     // 4.4.1 T1-8：端到端同进程双线程示例（threaddemo）。放风暴前执行并专候收尸，
     //    使风暴的 waitpid_any 不会误收 threaddemo 的僵尸。
-    threaddemo_launch();
-
-    // T2-0：真实 freestanding C 程序（x86-64 clang/lld 交叉链 + crt0）端到端。
-    chelldemo_launch();
-
-    // T2-3：C pthread 生命周期（create/join/detach/self）端到端。
-    pthreaddemo_launch();
-
-    // T2-4：C pthread 互斥/condvar/信号量（用户原子 + SYNC park）端到端。
-    pthread_syncdemo_launch();
-
-    // T2-5：真实 pthread 递归/join 基准（第三方惯用法）端到端。
-    launch_c_prog("/programs/pthread_bench.elf", "pthread_bench");
+    // threaddemo / chelldemo / pthreaddemo / pthread_syncdemo / pthread_bench
+    // 已移入 `selftest` 命令（开机直达 shell，按需运行）。
 
     // A2 音频管道 e2e 已移至 4.2.5（**必须在 intel-hda 认领消费者槽之前**）。
     // 此处不再调用：消费者槽位独占，迟跑必然 EBUSY。详见该处说明。
@@ -1085,27 +319,8 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     //
     // **必须放在 4.5 的 SIGKILL 风暴之前**：那个风暴会拉起 spinburn 并长时间
     // 运行（实测 300 秒未结束），放在它之后本自检根本不会被执行到。
-    shell_path_selfcheck();
-
-    // 4.7 audiofile 端到端自检：用**真实参数**播放一个真实 WAV。
-    //
-    // 为何放在启动期而不是留给人工在 shell 里敲：shell 的交互式 stdin
-    // 与启动期多个自检 shell 争用，命令会被它们吞掉，结果不可复现。
-    // 而 shell 支持**非交互模式**（argv 给一条命令即执行后退出），
-    // 于是可以像 shell_path_selfcheck 一样确定性地跑完整条链路。
-    //
-    // 覆盖点：读盘上的 WAV -> 解析 -> 写 dsp -> 等待 -> 退出码。
-    // 盘不存在时如实 SKIP（不假装验过）。
-    // 负例：不存在的文件、非 WAV 文件、目录 —— 必须如实报错而不是静默成功。
-    //
-    // 只验成功路径的话，「永远返回 0」的实现也能通过（S20/S39）。
-    audiofile_selftest_negative();
-
-    audiofile_selfcheck();
-
-    // 4.5 per-pid 锁化 + 跨核终止既有 bug 验证：跨核 spawn + SIGKILL terminate 风暴。
-    cross_core_sigkill_storm();
-
+    // shell 路径自检 / audiofile 播放自检（含负例）/ 跨核 SIGKILL 风暴
+    // 已移入 `selftest` 命令（开机直达 shell，按需运行）。
 
     // 5. init 进入 supervisor 循环：拉起 shell → 等其退出 → 重生。
     //    类 SysV 登录循环语义，PID 1 永不退出。
