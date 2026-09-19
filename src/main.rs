@@ -78,35 +78,53 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     (0..=hay.len() - needle.len()).any(|i| &hay[i..i + needle.len()] == needle)
 }
 
+/// 判断一个 NUL 结尾的 C 串是否**整个等于** `want`（逐字节比较，非子串匹配）。
+///
+/// 为何要抽成函数：argv 扫描此前把「求长度 + 比较」内联在循环里，加第二个开关就要
+/// 复制一份——而这段代码全是裸指针算术，"复制一份"正是最容易引入越界的地方。
+/// 抽出来后长度计算与比较各自只有一处，且 `n == want.len()` 同时充当越界守卫。
+fn arg_eq(p: *const u8, want: &[u8]) -> bool {
+    let mut n = 0usize;
+    // SAFETY: p 指向 NUL 结尾 C 串；n <= want.len() 使读取不越过已知长度。
+    while unsafe { *p.add(n) } != 0 && n <= want.len() {
+        n += 1;
+    }
+    if n != want.len() {
+        return false;
+    }
+    let mut k = 0usize;
+    while k < n {
+        // SAFETY: k < n <= want.len()，且已确认串长恰为 n，均在界内。
+        if unsafe { *p.add(k) } != want[k] {
+            return false;
+        }
+        k += 1;
+    }
+    true
+}
+
 /// init 主流程：打印信息、查询内核版本与堆断点、退出。
 #[unsafe(no_mangle)]
 pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
-    // argv 诊断开关：含 `--skip-hda` 时跳过 intel-hda 拉起（见 4.3.2 的说明）。
+    // argv 诊断开关（见 4.3.2 的说明）。
     // 为何用 argv 而非环境变量：libsys 无 environ 支持，而 argv 是既有机制
     // （shell 的非交互模式同款），无需新增子系统。
+    //
+    // 两个开关**相互独立**（曾经 selftest 挂在 skip-hda 下，那是因为 selftest 当时
+    // 只是「绕开 HDA 的 GPF」的附带产物；GPF 根因修复后两者已无因果关系，
+    // 继续耦合会让「跑 selftest」与「不启动 HDA」这两件不相干的事绑死）：
+    //   --skip-hda      ：不拉起 intel-hda（诊断用：隔离显示/音频侧影响）
+    //   --selftest      ：以非交互 shell 跑一遍 `selftest thread`（ADR-038 U1 入口）
     let mut skip_hda = false;
+    let mut run_selftest = false;
     if argc > 0 && !argv.is_null() {
         let mut i = 0isize;
         while i < argc {
             // SAFETY: i < argc，argv 由内核 exec 路径按 C 数组构造，NUL 结尾。
             let p = unsafe { *argv.offset(i) };
             if !p.is_null() {
-                const FLAG: &[u8] = b"--skip-hda";
-                let mut n = 0usize;
-                // SAFETY: p 指向 NUL 结尾 C 串，n 越界前必遇 0。
-                while unsafe { *p.add(n) } != 0 && n <= FLAG.len() {
-                    n += 1;
-                }
-                if n == FLAG.len() {
-                    let mut same = true;
-                    let mut k = 0usize;
-                    while k < n {
-                        // SAFETY: k < n <= FLAG.len()，均在界内。
-                        if unsafe { *p.add(k) } != FLAG[k] { same = false; break; }
-                        k += 1;
-                    }
-                    if same { skip_hda = true; }
-                }
+                if arg_eq(p, b"--skip-hda") { skip_hda = true; }
+                else if arg_eq(p, b"--selftest") { run_selftest = true; }
             }
             i += 1;
         }
@@ -372,17 +390,21 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     // shell 路径自检 / audiofile 播放自检（含负例）/ 跨核 SIGKILL 风暴
     // 已移入 `selftest` 命令（开机直达 shell，按需运行）。
 
-    // 4.7 `--skip-hda` 专用：非交互跑 `selftest thread`（ADR-038 U1 的端到端验收）。
+    // 4.7 `--selftest` 专用：非交互跑 `selftest thread`（ADR-038 U1 的端到端验收）。
     //
     // **为何需要这一条**：`selftest` 是 shell 命令（`shell/src/commands.rs`），而本
     // 环境 shell 的 stdin 是 PS/2 键盘——无法从串口日志自动驱动输入行。所以
     // `selftest thread` 里的 forkdemo 验收在**自动化构建**中永远不会被执行到，
     // 除非由 init 经 argv 拉起（这正是上面 4.6 说明的既有手法，ADR-029）。
     //
-    // 仅在 `--skip-hda` 时启用：该 flag 的存在意义就是「绕开 intel-hda 的既有 GPF
-    // 以验证**其它**用户态路径」，把 forkdemo 验收挂在同一 flag 下语义一致；
-    // 正常启动路径（不带 flag）行为完全不变。
-    if skip_hda {
+    // 用**独立**的 `--selftest` 而非复用 `--skip-hda`：当初挂在 skip-hda 下，是因为
+    // selftest 只是「绕开 HDA 的 GPF 去看别的路径」的附带产物。那个 GPF 的根因
+    // （syscall 入口帧缺 RPL=3，见 kernel `ad6222a`）**已经修复**，两者不再有因果
+    // 关系——继续耦合会让「我要跑 selftest」被迫等价于「我不想要 HDA」，
+    // 既误导使用者，也让 selftest 在带 HDA 的真实配置下无法被跑到。
+    //
+    // 正常启动路径（不带任何 flag）行为完全不变。
+    if run_selftest {
         let _ = write(
             STDOUT,
             b"[init] running `selftest thread` (non-interactive; ADR-038 U1 forkdemo E2E)\n",
