@@ -80,7 +80,38 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
 
 /// init 主流程：打印信息、查询内核版本与堆断点、退出。
 #[unsafe(no_mangle)]
-pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
+pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
+    // argv 诊断开关：含 `--skip-hda` 时跳过 intel-hda 拉起（见 4.3.2 的说明）。
+    // 为何用 argv 而非环境变量：libsys 无 environ 支持，而 argv 是既有机制
+    // （shell 的非交互模式同款），无需新增子系统。
+    let mut skip_hda = false;
+    if argc > 0 && !argv.is_null() {
+        let mut i = 0isize;
+        while i < argc {
+            // SAFETY: i < argc，argv 由内核 exec 路径按 C 数组构造，NUL 结尾。
+            let p = unsafe { *argv.offset(i) };
+            if !p.is_null() {
+                const FLAG: &[u8] = b"--skip-hda";
+                let mut n = 0usize;
+                // SAFETY: p 指向 NUL 结尾 C 串，n 越界前必遇 0。
+                while unsafe { *p.add(n) } != 0 && n <= FLAG.len() {
+                    n += 1;
+                }
+                if n == FLAG.len() {
+                    let mut same = true;
+                    let mut k = 0usize;
+                    while k < n {
+                        // SAFETY: k < n <= FLAG.len()，均在界内。
+                        if unsafe { *p.add(k) } != FLAG[k] { same = false; break; }
+                        k += 1;
+                    }
+                    if same { skip_hda = true; }
+                }
+            }
+            i += 1;
+        }
+    }
+
     // 1. 欢迎信息（验证 write）。
     let _ = write(STDOUT, b"[init] Hello from real userspace (Rust + libsys)!\n");
 
@@ -221,6 +252,19 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     // 4.3.2 拉起阶段三 intel-hda（ICH6 HD Audio）用户态声卡驱动带起。
     //    无 HDA 控制器（QEMU 未加 -device intel-hda）时驱动自查无设备并干净退出——
     //    非致命。加 -device intel-hda 后驱动认领/复位/枚举 codec（阶段三带起）。
+    //
+    // **可诊断性开关（ADR-038 U1 引入）**：以 argv 含 `--skip-hda` 启动 init 时跳过本步。
+    // 动机是实测踩到的一个**与本开关无关的既有缺陷**：`br --release`（注意：**不带**
+    // 任何 `--test-*`）时，intel-hda 在 `[uio] claim mapped ... -> user 0x101000000`
+    // 之后立刻触发 General Protection Fault（vector 0xd，rip 0xffffffff8007614d），
+    // 整个用户态启动因此停摆，永远到不了 shell。该缺陷在**暂存本工作全部改动后的
+    // 纯净检出**上以**同一 rip** 复现，故与本工作无关，属另一条独立线索。
+    //
+    // 加这个开关而不是直接改崩溃点：声卡驱动的 MMIO 复位序列需要真实设备语义，
+    // 不该为通过一项进程模型的验收而仓促改动；而本开关让**其它用户态路径**（含
+    // forkdemo 端到端验收）能在该缺陷修复前继续被验证。跳过时**如实打印**，
+    // 绝不静默（失败必须可见）。
+    if !skip_hda {
     // `--quiet`：驱动本身默认会打 150 行 bring-up 取证（CORB/RIRB 轮询、
             // codec 枚举、放大路由），足够淹没 shell 提示符。此处显式要求只留
             // 结论行；需要逐步取证时去掉该参数单独跑驱动即可。
@@ -234,6 +278,12 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
         Err(_) => {
             let _ = write(STDOUT, b"[init] exec_path(intel-hda.elf) failed (non-fatal)\n");
         }
+        }
+    } else {
+        let _ = write(
+            STDOUT,
+            b"[init] intel-hda SKIPPED (--skip-hda; see ADR-038 U1 note on the pre-existing GPF)\n",
+        );
     }
 
     // 4.3.3 A3：拉起**音频流生产者**，把已知 PCM 写进 /devices/audio/dsp。
@@ -321,6 +371,60 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
     // 运行（实测 300 秒未结束），放在它之后本自检根本不会被执行到。
     // shell 路径自检 / audiofile 播放自检（含负例）/ 跨核 SIGKILL 风暴
     // 已移入 `selftest` 命令（开机直达 shell，按需运行）。
+
+    // 4.7 `--skip-hda` 专用：非交互跑 `selftest thread`（ADR-038 U1 的端到端验收）。
+    //
+    // **为何需要这一条**：`selftest` 是 shell 命令（`shell/src/commands.rs`），而本
+    // 环境 shell 的 stdin 是 PS/2 键盘——无法从串口日志自动驱动输入行。所以
+    // `selftest thread` 里的 forkdemo 验收在**自动化构建**中永远不会被执行到，
+    // 除非由 init 经 argv 拉起（这正是上面 4.6 说明的既有手法，ADR-029）。
+    //
+    // 仅在 `--skip-hda` 时启用：该 flag 的存在意义就是「绕开 intel-hda 的既有 GPF
+    // 以验证**其它**用户态路径」，把 forkdemo 验收挂在同一 flag 下语义一致；
+    // 正常启动路径（不带 flag）行为完全不变。
+    if skip_hda {
+        let _ = write(
+            STDOUT,
+            b"[init] running `selftest thread` (non-interactive; ADR-038 U1 forkdemo E2E)\n",
+        );
+        match libsys::exec_path("/programs/shell.elf", b"selftest thread") {
+            Ok(pid) => {
+                let mut buf = [0u8; 8];
+                let _ = write(STDOUT, b"[init] selftest(thread) shell pid ");
+                let _ = write(STDOUT, dec_u64(pid, &mut buf));
+                let _ = write(STDOUT, b"\n");
+                // 专候本 pid 收尸：不能让 supervisor 的 waitpid_any 误收它的僵尸，
+                // 否则退出码（本验收的关键证据）会丢在别处。
+                let mut spins: u32 = 0;
+                loop {
+                    match libsys::waitpid_any() {
+                        Ok(wr) if wr.pid == pid => {
+                            let mut b2 = [0u8; 8];
+                            let _ = write(STDOUT, b"[init] selftest(thread) exited with code ");
+                            let _ = write(STDOUT, dec_u64(wr.code as u64, &mut b2));
+                            let _ = write(STDOUT, b" (0 = all assertions passed)\n");
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(_) => {
+                            spins += 1;
+                            if spins > 400_000 {
+                                let _ = write(
+                                    STDOUT,
+                                    b"[init] selftest(thread) reap timeout (non-fatal)\n",
+                                );
+                                break;
+                            }
+                            let _ = libsys::yield_now();
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                let _ = write(STDOUT, b"[init] exec_path(shell.elf, selftest thread) failed\n");
+            }
+        }
+    }
 
     // 5. init 进入 supervisor 循环：拉起 shell → 等其退出 → 重生。
     //    类 SysV 登录循环语义，PID 1 永不退出。
