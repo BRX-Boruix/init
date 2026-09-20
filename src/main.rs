@@ -267,6 +267,23 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         }
     }
 
+    // 4.3.1.1 拉起用户态账户守护进程 userd（ADR-040 §2.8 / A1-8）。
+    //    读 /config/users.json → 逐账户 mkdir /users/<name> + chown + chmod 0700
+    //    + identity 投影；账户表缺失/为空时如实驻留等待（不伪造账户）。
+    //    不等待（守护进程自身永不退出）；启动失败不阻断 shell（非致命，
+    //    /users 为空目录仍是诚实状态——账户表可由用户态工具直接读取）。
+    match libsys::exec_path("/programs/userd.elf", &[]) {
+        Ok(pid) => {
+            let mut buf = [0u8; 8];
+            let _ = write(STDOUT, b"[init] userd started (pid ");
+            let _ = write(STDOUT, dec_u64(pid, &mut buf));
+            let _ = write(STDOUT, b")\n");
+        }
+        Err(_) => {
+            let _ = write(STDOUT, b"[init] exec_path(userd.elf) failed (non-fatal)\n");
+        }
+    }
+
     // 4.3.2 拉起阶段三 intel-hda（ICH6 HD Audio）用户态声卡驱动带起。
     //    无 HDA 控制器（QEMU 未加 -device intel-hda）时驱动自查无设备并干净退出——
     //    非致命。加 -device intel-hda 后驱动认领/复位/枚举 codec（阶段三带起）。
