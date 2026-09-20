@@ -115,8 +115,10 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     // 继续耦合会让「跑 selftest」与「不启动 HDA」这两件不相干的事绑死）：
     //   --skip-hda      ：不拉起 intel-hda（诊断用：隔离显示/音频侧影响）
     //   --selftest      ：以非交互 shell 跑一遍 `selftest thread`（ADR-038 U1 入口）
+//   --selftest-quick：以非交互 shell 跑一遍 `selftest quick`（A2-5 账户查询 E2E 入口）
     let mut skip_hda = false;
     let mut run_selftest = false;
+    let mut run_selftest_quick = false;
     if argc > 0 && !argv.is_null() {
         let mut i = 0isize;
         while i < argc {
@@ -125,8 +127,22 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
             if !p.is_null() {
                 if arg_eq(p, b"--skip-hda") { skip_hda = true; }
                 else if arg_eq(p, b"--selftest") { run_selftest = true; }
+                else if arg_eq(p, b"--selftest-quick") { run_selftest_quick = true; }
             }
             i += 1;
+        }
+    }
+
+    // 构建期预置开关（见 build.rs）：本环境 init 恒以**空 argv** 启动（内核生产
+    // 路径不带 argv，且无 kernel cmdline），故运行期无法从外部传开关。
+    // `BORUIX_INIT_ARGS` 由构建脚本作为编译期常量注入，使自动化构建能跑到
+    // 需要非交互驱动的用户态验收（否则 shell 的 stdin 是 PS/2 键盘，串口日志
+    // 驱动不了输入行）。运行期 argv 优先于构建期预置——两者可叠加。
+    if let Some(pre) = option_env!("BORUIX_INIT_ARGS") {
+        for want in pre.split_ascii_whitespace() {
+            if want == "--selftest" { run_selftest = true; }
+            else if want == "--selftest-quick" { run_selftest_quick = true; }
+            else if want == "--skip-hda" { skip_hda = true; }
         }
     }
 
@@ -461,6 +477,54 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
             }
             Err(_) => {
                 let _ = write(STDOUT, b"[init] exec_path(shell.elf, selftest thread) failed\n");
+            }
+        }
+    }
+
+    // 4.8 `--selftest-quick` 专用：非交互跑 `selftest quick`（A2-5 账户查询 E2E 入口）。
+    //
+    // **为何需要独立 flag**：`libccheck`/`pwde2e` 都是"按需运行"的用户态验收，
+    // 而本环境 shell 的 stdin 是 PS/2 键盘——无法从串口日志自动驱动输入行。
+    // 故与 4.7 同法，由 init 经 argv 拉起 shell 执行一条真实命令行（ADR-029 手法）。
+    //
+    // **为何不复用 `--selftest`**：那个 flag 的语义已被 ADR-038 U1 钉死为
+    // "跑 selftest thread（forkdemo E2E）"。把 quick 塞进去会让"我要验账户查询"
+    // 被迫等价于"我要跑线程组"，与 4.7 注释里反对的耦合是同一类错误。
+    if run_selftest_quick {
+        let _ = write(
+            STDOUT,
+            b"[init] running `selftest quick` (non-interactive; A2-5 pwd E2E)\n",
+        );
+        match libsys::exec_path("/programs/shell.elf", b"selftest quick") {
+            Ok(pid) => {
+                let mut buf = [0u8; 8];
+                let _ = write(STDOUT, b"[init] selftest(quick) shell pid ");
+                let _ = write(STDOUT, dec_u64(pid, &mut buf));
+                let _ = write(STDOUT, b"\n");
+                let mut spins: u32 = 0;
+                loop {
+                    match libsys::waitpid_any() {
+                        Ok(wr) if wr.pid == pid => {
+                            let mut b2 = [0u8; 8];
+                            let _ = write(STDOUT, b"[init] selftest(quick) exited with code ");
+                            let _ = write(STDOUT, dec_u64(wr.code as u64, &mut b2));
+                            let _ = write(STDOUT, b" (0 = all assertions passed)\n");
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(_) => {
+                            spins += 1;
+                            if spins > 400_000 {
+                                let _ = write(STDOUT, b"[init] selftest(quick) reap timeout (non-fatal)\n");
+                                break;
+                            }
+                            let _ = libsys::yield_now();
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                let _ = write(STDOUT, b"[init] exec_path(shell.elf, selftest quick) failed\n");
             }
         }
     }
