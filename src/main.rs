@@ -610,6 +610,96 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         }
     }
 
+    // 4.10 A2-7（ADR-041 §1.3）：以 `login` 做**认证关口**，通过后才进入交互 shell。
+    //
+    // 【为何在 init 里做这一手】内核 `exec_path` 语义是**继承**父进程身份，没有"以指定
+    // 身份 spawn"的参数。而 `login` 必须是 uid 0 + **精确能力集**，否则读不到 root-only
+    // 的 shadow 文件。故唯一可行路径是：init 先把自己的身份设为 login 所需的能力集，
+    // 再 exec login —— login 自己在认证成功后降权到目标用户。
+    //
+    // 【能力集为何是这些值】**实测定案**（ADR-041 §1.2.3，kernel `2d48106` 的
+    // `test_login_capability_set`），不是推断：
+    //   - uid 0 是 shadow 文件**属主** ⇒ 以属主命中读取，**不需要**任何 DAC 覆盖能力；
+    //   - **必须不含 CAP_OWNER**：实测 `CAP_OWNER` **完全绕过**策略求值，持它则口令
+    //     文件形同虚设（`test_shadow_file_separation` 第 ③ 组）；
+    //   - **必须不含 CAP_SYSTEM**：持它者可调 `identity_set` 变为 uid 0 间接读得 shadow；
+    //   - **含 CAP_KILL**：使普通用户的信号被 A2-0 单点判定拒绝（ADR-040 §3.5.4 #15）。
+    //
+    // 【为何不用 `ProcessIdentity::system(1)`】它的 caps 是
+    // `SYSTEM|DEVICE|MEMORY|KILL|OWNER`（`process.rs:300`）——**含 OWNER**。
+    // 直接用它等于把口令文件敞开，是本 ADR 明令禁止的做法，故此处处处显式写出。
+    //
+    // 【id 位定义】与内核 `task::Caps` 对齐（ADR-040 §2.3，共 5 位，无保留位）：
+    // SYSTEM=1<<0, DEVICE=1<<1, MEMORY=1<<2, KILL=1<<3, OWNER=1<<4。此处只用 KILL。
+    //
+    // 【非交互路径不受影响】`--selftest` / `--selftest-quick` / `--run=` 三个自动化入口
+    // 在上面已各自完成并 return/静默，**不会**走到这里；正常启动路径的行为由本节改变
+    // （原本直接 exec shell，现在先过 login）——这正是 A2-7 的目标，且已记入 ADR-041。
+    {
+        /// `Caps::KILL`（1<<3）——防普通用户信号（C4）。
+        const LOGIN_CAPS_KILL: u32 = 1 << 3;
+        /// `Caps::SYSTEM`（1<<0）——**降权所需**（C3）。
+        /// **实测**（kernel `test_login_downgrade_path` 事实 1）：`{uid0,KILL}` 调
+        /// `identity_set(1000,1000,0)` 返回 **EACCES**、uid 仍为 0。A2-1 的规则是
+        /// "无 `CAP_SYSTEM` 则 uid 不得改变"（`syscall.rs:2999`），故**没有它就无法降权**。
+        /// 注意它**只**影响 `identity_set`，**不影响文件策略**（事实 2：`{uid0,SYSTEM|KILL}`
+        /// 与 `{uid0,KILL}` 读 shadow 结果相同），故不扩大 login 的读表能力。
+        const LOGIN_CAPS_SYSTEM: u32 = 1 << 0;
+        /// login 的完整能力集 = `SYSTEM | KILL`。**不含 OWNER**——含它则口令文件形同虚设。
+        const LOGIN_CAPS: u32 = LOGIN_CAPS_SYSTEM | LOGIN_CAPS_KILL;
+        let _ = write(STDOUT, b"[init] starting login (uid 0, caps=SYSTEM|KILL; no OWNER)\n");
+        match libsys::identity_set(0, 0, LOGIN_CAPS) {
+            Ok(()) => {}
+            Err(_) => {
+                // 身份设置失败：**不**降级继续（否则 login 读不到 shadow，
+                // 或更糟——以 init 的 System 全能力身份启动 login，等于把口令文件敞开）。
+                let _ = write(STDOUT, b"[init] identity_set for login FAILED; refusing to continue\n");
+            }
+        }
+        // 认证失败 3 次后 login 以非零退出。此处**只登录一次**：退出后不自动重试，
+        // 而是进入下面第 5 节的 supervisor 循环（拉起 shell）——该行为此时等价于
+        // "认证未通过仍给了 shell"，**不能接受**。故此处对 login 的返回值如实判定。
+        match libsys::exec_path("/programs/login.elf", &[]) {
+            Ok(pid) => {
+                let mut buf = [0u8; 8];
+                let _ = write(STDOUT, b"[init] login pid ");
+                let _ = write(STDOUT, dec_u64(pid, &mut buf));
+                let _ = write(STDOUT, b"\n");
+                let mut spins: u32 = 0;
+                loop {
+                    match libsys::waitpid_any() {
+                        Ok(wr) if wr.pid == pid => {
+                            let mut b2 = [0u8; 8];
+                            let _ = write(STDOUT, b"[init] login exited with code ");
+                            let _ = write(STDOUT, dec_u64(wr.code as u64, &mut b2));
+                            let _ = write(STDOUT, b"\n");
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(_) => {
+                            spins += 1;
+                            if spins > 400_000 {
+                                let _ = write(STDOUT, b"[init] login reap timeout\n");
+                                break;
+                            }
+                            let _ = libsys::yield_now();
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                let _ = write(STDOUT, b"[init] exec_path(login.elf) failed\n");
+            }
+        }
+        // **认证关口语义（关键）**：login 内部认证成功后，会在**自己的**进程里降权并
+        // exec shell —— 也就是说成功的会话**不会**回到这里。因此走到本行即意味着
+        // login 是失败退出（3 次机会耗尽）或无法启动。此时 init 的身份是上面设的
+        // "uid 0 + KILL"，**不含 OWNER/SYSTEM**，不足以读 shadow、也不足以绕过策略，
+        // 且下面第 5 节的 shell 会以该身份运行（非特权）——不会把特权交给未认证者。
+        // 如实记录这一点，避免把"登录失败"误读为"系统启动异常"。
+        let _ = write(STDOUT, b"[init] login session ended without success; falling through to supervisor\n");
+    }
+
     // 5. init 进入 supervisor 循环：拉起 shell → 等其退出 → 重生。
     //    类 SysV 登录循环语义，PID 1 永不退出。
     //    也负责收尸被过继给 init 的孤儿进程，并区分日志。
