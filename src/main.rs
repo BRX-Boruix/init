@@ -656,9 +656,12 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
                 let _ = write(STDOUT, b"[init] identity_set for login FAILED; refusing to continue\n");
             }
         }
-        // 认证失败 3 次后 login 以非零退出。此处**只登录一次**：退出后不自动重试，
-        // 而是进入下面第 5 节的 supervisor 循环（拉起 shell）——该行为此时等价于
-        // "认证未通过仍给了 shell"，**不能接受**。故此处对 login 的返回值如实判定。
+        // 认证失败 3 次后 login 以非零退出。此处**只登录一次**：退出后交由下面
+        // 第 5 节的 supervisor 循环处理——而该循环的重生目标是**再次拉起 login**
+        // （类 getty 语义），**绝不**直接拉起 shell。此前版本曾把 supervisor 的
+        // 重生目标写成 shell，等于"认证未通过仍给了 shell"（实测：连续 6 次空
+        // 回车 → 3 次尝试耗尽 → 直接得到 uid 0 的交互 shell，认证关口完全旁路），
+        // 现已修复并记入 ADR-041 §1.3 / R13。
         match libsys::exec_path("/programs/login.elf", &[]) {
             Ok(pid) => {
                 let mut buf = [0u8; 8];
@@ -694,17 +697,24 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         // **认证关口语义（关键）**：login 内部认证成功后，会在**自己的**进程里降权并
         // exec shell —— 也就是说成功的会话**不会**回到这里。因此走到本行即意味着
         // login 是失败退出（3 次机会耗尽）或无法启动。此时 init 的身份是上面设的
-        // "uid 0 + KILL"，**不含 OWNER/SYSTEM**，不足以读 shadow、也不足以绕过策略，
-        // 且下面第 5 节的 shell 会以该身份运行（非特权）——不会把特权交给未认证者。
-        // 如实记录这一点，避免把"登录失败"误读为"系统启动异常"。
-        let _ = write(STDOUT, b"[init] login session ended without success; falling through to supervisor\n");
+        // "uid 0 + SYSTEM|KILL"（login 所需），不带它去开 shell，而是由 supervisor
+        // **重新拉起 login** 让认证重来——绝无"未认证 shell"。此处如实记录，
+        // 避免把"登录失败"误读为"系统启动异常"。
+        let _ = write(STDOUT, b"[init] login session ended; supervisor will restart login\n");
     }
 
-    // 5. init 进入 supervisor 循环：拉起 shell → 等其退出 → 重生。
-    //    类 SysV 登录循环语义，PID 1 永不退出。
+    // 5. init 进入 supervisor 循环：拉起 login →（认证成功后 login 自行 exec shell）
+    //    → 等会话退出 → 重生 login。类 getty/SysV 登录循环语义，PID 1 永不退出。
     //    也负责收尸被过继给 init 的孤儿进程，并区分日志。
+    //
+    // 【重生目标必须是 login，不能是 shell（R13，ADR-041 §1.3）】本循环若直接
+    // exec shell，则任何未认证者只需让 login 失败退出（3 次空回车即耗尽）就能
+    // 拿到交互 shell——且 supervisor 无 `identity_set`，shell 继承的是上面为
+    // login 设的 "uid 0 + SYSTEM|KILL"：实测等于「6 次回车进 root shell」。
+    // 修复后 supervisor 的重生目标只有 login；shell 的启动点唯一收敛在
+    // login 内部（认证通过后 exec），init 从不直接开 shell。
     let _ = write(STDOUT, b"[init] entering supervisor loop\n");
-    // supervisor：拉起 shell 一次，然后**只等**；只有确认 shell 本身已退出才重生。
+    // supervisor：拉起 login 一次，然后**只等**；只有确认会话进程本身已退出才重生。
     //
     // 旧实现把 `exec_path(shell)` 放在 `loop` 顶部。收尸分支无论走哪条路都要
     // 回到循环顶再 exec 一遍 —— 于是**每收到一个被过继的孤儿就重开一个 shell**，
@@ -713,20 +723,20 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     // `cat not-an-elf.txt` → `t not-an-f.tt`）—— 用户报的「命令对不对全靠运气」。
     //
     // 结构纪律：`exec` 属于**重生**动作，必须在等待循环**之外**；等待循环内
-    // 只允许两类出口 —— 继续等（孤儿/瞬时失败）或跳出重生（shell 真死了）。
+    // 只允许两类出口 —— 继续等（孤儿/瞬时失败）或跳出重生（会话真死了）。
     loop {
-        // ---- 重生点：只有走到这里才拉起新 shell ----
-        let shell_pid: u64 = loop {
-            match libsys::exec_path("/programs/shell.elf", &[]) {
+        // ---- 重生点：只有走到这里才拉起新 login（认证关口）----
+        let session_pid: u64 = loop {
+            match libsys::exec_path("/programs/login.elf", &[]) {
                 Ok(pid) => {
                     let mut buf = [0u8; 8];
-                    let _ = write(STDOUT, b"[init] shell started (pid ");
+                    let _ = write(STDOUT, b"[init] login started (pid ");
                     let _ = write(STDOUT, dec_u64(pid, &mut buf));
                     let _ = write(STDOUT, b")\n");
                     break pid;
                 }
                 Err(_) => {
-                    let _ = write(STDOUT, b"[init] exec_path(shell.elf) failed, retrying...\n");
+                    let _ = write(STDOUT, b"[init] exec_path(login.elf) failed, retrying...\n");
                     // 启动失败时短眠再试（避免忙转），走 TASK_WAIT(0, 500ms)
                     let _ = libsys::sleep(500_000_000);
                 }
@@ -736,15 +746,15 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         loop {
             match waitpid_any() {
                 Ok(wr) => {
-                    // 判断退出的是 shell 还是被过继的孤儿：读
-                    // /processes/{shell_pid}/status。可读 → shell 还在；
-                    // NotFound → shell 已死，跳出本循环去重生。
+                    // 判断退出的是会话进程（login→shell）还是被过继的孤儿：读
+                    // /processes/{session_pid}/status。可读 → 会话还在；
+                    // NotFound → 会话已死，跳出本循环去重生 login。
                     let mut path_buf = [0u8; 32];
                     let prefix = b"/processes/";
                     let suffix = b"/status";
                     path_buf[..prefix.len()].copy_from_slice(prefix);
                     let mut pid_buf = [0u8; 8];
-                    let pid_str = dec_u64(shell_pid, &mut pid_buf);
+                    let pid_str = dec_u64(session_pid, &mut pid_buf);
                     let start = prefix.len();
                     path_buf[start..start + pid_str.len()].copy_from_slice(pid_str);
                     let end = start + pid_str.len();
@@ -752,25 +762,27 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
                     let path = core::str::from_utf8(&path_buf[..end + suffix.len()])
                         .unwrap_or("/processes/list");
                     if libsys::read_to_end(path).is_ok() {
-                        // shell 仍在运行 → 退出的是被过继给 init 的孤儿。
+                        // 会话进程仍在运行 → 退出的是被过继给 init 的孤儿。
                         // 继续等下一个，**绝不重生**。
                         let mut buf = [0u8; 8];
                         let _ = write(STDOUT, b"[init] reaped orphan (code ");
                         let _ = write(STDOUT, dec_u64(wr.code, &mut buf));
                         let _ = write(STDOUT, b"), continuing\n");
                     } else {
-                        // shell 已退出 → 跳出等待循环，外层重生。
+                        // 会话已退出（用户 shell 正常退出，或 login 认证失败）
+                        // → 跳出等待循环，外层重生 login（重新认证，绝不开 shell）。
                         let mut buf = [0u8; 8];
-                        let _ = write(STDOUT, b"[init] shell exited (code ");
+                        let _ = write(STDOUT, b"[init] session ended (code ");
                         let _ = write(STDOUT, dec_u64(wr.code, &mut buf));
-                        let _ = write(STDOUT, b"), respawning\n");
+                        let _ = write(STDOUT, b"), respawning login\n");
                         break;
                     }
                 }
                 Err(_) => {
                     // 等待失败（含 `WouldBlock`：本核暂无就绪者但子进程仍在跑）。
-                    // 让出后继续等，**绝不重生** —— 那正是并发 shell 抢键盘的成因。
-                    let _ = libsys::yield_now();
+                    // 短眠后继续等，**绝不重生** —— 那正是并发 shell 抢键盘的成因
+                    // （此前忙转 `yield_now`，会话常驻等待时 init 空耗 CPU）。
+                    let _ = libsys::sleep(100_000_000);
                 }
             }
         }
