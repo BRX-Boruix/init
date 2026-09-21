@@ -78,6 +78,32 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     (0..=hay.len() - needle.len()).any(|i| &hay[i..i + needle.len()] == needle)
 }
 
+/// 判断 C 串是否以 `prefix` 开头（用于 `--run=<命令行>` 这类带值开关）。
+///
+/// 边界：只比较到 prefix 结束，不读串尾更远处——即便串比 prefix 短也安全返回 false。
+fn arg_starts_with(p: *const u8, prefix: &[u8]) -> bool {
+    let mut k = 0usize;
+    while k < prefix.len() {
+        // SAFETY: k < prefix.len()，逐字节比较；遇 NUL 立即返回 false。
+        if unsafe { *p.add(k) } != prefix[k] {
+            return false;
+        }
+        k += 1;
+    }
+    true
+}
+
+/// 取 C 串在 `prefix` 之后的剩余部分（调用方须先确认 `arg_starts_with`）。
+/// 返回的切片借用 argv 原内存，生命周期与 argv 相同（无需复制）。
+fn arg_rest(p: *const u8, prefix: &[u8]) -> &[u8] {
+    let mut n = prefix.len();
+    // SAFETY: p 为 NUL 结尾 C 串；n 停在 NUL 上。
+    while unsafe { *p.add(n) } != 0 {
+        n += 1;
+    }
+    // SAFETY: [prefix.len(), n) 落在已确认的串范围内。
+    unsafe { core::slice::from_raw_parts(p.add(prefix.len()), n - prefix.len()) }
+}
 /// 判断一个 NUL 结尾的 C 串是否**整个等于** `want`（逐字节比较，非子串匹配）。
 ///
 /// 为何要抽成函数：argv 扫描此前把「求长度 + 比较」内联在循环里，加第二个开关就要
@@ -119,6 +145,8 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     let mut skip_hda = false;
     let mut run_selftest = false;
     let mut run_selftest_quick = false;
+    // --run=<命令行>：以非交互 shell 执行**任意**一条命令行（A2-4/A2-5 通用验收入口）。
+    let mut run_cmd: Option<&[u8]> = None;
     if argc > 0 && !argv.is_null() {
         let mut i = 0isize;
         while i < argc {
@@ -128,6 +156,7 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
                 if arg_eq(p, b"--skip-hda") { skip_hda = true; }
                 else if arg_eq(p, b"--selftest") { run_selftest = true; }
                 else if arg_eq(p, b"--selftest-quick") { run_selftest_quick = true; }
+                else if arg_starts_with(p, b"--run=") { run_cmd = Some(arg_rest(p, b"--run=")); }
             }
             i += 1;
         }
@@ -143,6 +172,10 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
             if want == "--selftest" { run_selftest = true; }
             else if want == "--selftest-quick" { run_selftest_quick = true; }
             else if want == "--skip-hda" { skip_hda = true; }
+            else if let Some(rest) = want.strip_prefix("--run=") {
+                // 构建期常量是 &'static str，可直接借出。
+                run_cmd = Some(rest.as_bytes());
+            }
         }
     }
 
@@ -525,6 +558,54 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
             }
             Err(_) => {
                 let _ = write(STDOUT, b"[init] exec_path(shell.elf, selftest quick) failed\n");
+            }
+        }
+    }
+    // 4.9 `--run=<命令行>`：以非交互 shell 执行**任意**一条命令行（通用验收入口）。
+    //
+    // **为何需要通用形态**：4.7/4.8 是两个用途固定的开关；而"跑 libccheck"、"跑某条
+    // 内建命令做端到端核对"这类需求会持续出现。与其每来一个就加一个 flag（flag 数量
+    // 无上界、且每个都要复制一遍收尸循环），不如提供一个**不新增机制**的通用入口：
+    // 传入什么命令行就执行什么——走的仍是 shell 的非交互 argv 路径（ADR-029），
+    // 与用户手敲完全同路。
+    //
+    // 优先级最低：--selftest / --selftest-quick 语义明确，若同时给出以它们为准。
+    if let Some(cmd) = run_cmd {
+        if !run_selftest && !run_selftest_quick {
+            let _ = write(STDOUT, b"[init] running non-interactive command: ");
+            let _ = write(STDOUT, cmd);
+            let _ = write(STDOUT, b"\n");
+            match libsys::exec_path("/programs/shell.elf", cmd) {
+                Ok(pid) => {
+                    let mut buf = [0u8; 8];
+                    let _ = write(STDOUT, b"[init] run shell pid ");
+                    let _ = write(STDOUT, dec_u64(pid, &mut buf));
+                    let _ = write(STDOUT, b"\n");
+                    let mut spins: u32 = 0;
+                    loop {
+                        match libsys::waitpid_any() {
+                            Ok(wr) if wr.pid == pid => {
+                                let mut b2 = [0u8; 8];
+                                let _ = write(STDOUT, b"[init] run exited with code ");
+                                let _ = write(STDOUT, dec_u64(wr.code as u64, &mut b2));
+                                let _ = write(STDOUT, b" (0 = all assertions passed)\n");
+                                break;
+                            }
+                            Ok(_) => continue,
+                            Err(_) => {
+                                spins += 1;
+                                if spins > 400_000 {
+                                    let _ = write(STDOUT, b"[init] run reap timeout (non-fatal)\n");
+                                    break;
+                                }
+                                let _ = libsys::yield_now();
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    let _ = write(STDOUT, b"[init] exec_path(shell.elf, --run) failed\n");
+                }
             }
         }
     }
