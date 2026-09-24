@@ -58,13 +58,37 @@ fn print_hex(label: &[u8], v: u64) {
 ///   3. consumer 醒来逐字节校验、commit、detach，退出 0。
 ///
 /// 失败不致命（非 fatal）：测试失败要**可见**，但不能让系统起不来。
-/// 等待音频消费者就位的有界重试轮数。
+/// 等待 intel-hda 完成 attach 的**时间上界**（毫秒）。
 ///
-/// 取值依据：intel-hda 要完成"认领控制器 -> 复位 -> 枚举 codec -> R1 能力查询
-/// -> attach -> 预填"才置位 consumer。单次 `yield_now()` 会让出整个调度轮，
-/// 故几百轮足以覆盖，且不会像初版的 3000 那样拖上数分钟。
+/// 【缺陷修正】原实现是 `AUDIO_ATTACH_WAIT_ROUNDS = 600` 次 `yield_now()`。
+/// 那是**用调度轮次猜时间**，而轮次与真实时间没有固定换算：`yield_now()` 的
+/// 代价取决于当时有多少就绪任务，4 核 SMP 下还受其它守护进程影响。
+///
+/// 实测后果（`--release`，`--systemdisk --redisk`）：600 轮在 intel-hda 完成
+/// "认领控制器 -> 复位 -> 枚举 codec -> 能力查询 -> attach"之前就耗尽，于是
+///
+///     [init] audio ring consumer attached = false
+///     [init] no audio consumer (no HDA device?); skipping audiod (honest skip)
+///     [audio] pid=5 attached as PCM consumer        <- 驱动此时才 attach
+///
+/// init 判定"无消费者"并**永久跳过 audiod**——而 audiod 是唯一往 PCM ring 写
+/// 数据的生产者。后果是 ring 永远空：驱动侧 `prefilled 0 bytes`、DMA 只播静音、
+/// `stream_loop` 每 100ms 超时空转并刷屏。
+///
+/// 注意这不是"等得不够久"，而是**等待与真实时间脱钩**：无论把 600 改成多少，
+/// 都无法保证覆盖——那只是换一个猜的数字（S13）。故改为等**真实时间**。
+///
+/// 取值依据：HDA 初始化要复位控制器、等 codec 枚举与 R1 能力查询，实测在
+/// QEMU/TCG 下约 1-3 秒（`build` 出的 release 内核日志里，从 `[init] intel-hda
+/// started` 到 `[audio] pid=5 attached` 之间还隔着 login 的启动）。取 15 秒：
+/// 足够覆盖 TCG 慢速路径，又不至于在无 HDA 设备时让用户等太久。
 /// 有界是刻意的：无 HDA 设备时**必须**能退出并如实跳过（S20 失败模式优先）。
-const AUDIO_ATTACH_WAIT_ROUNDS: u32 = 600;
+const AUDIO_ATTACH_WAIT_MS: u64 = 15_000;
+/// 轮询 `/devices/audio/dsp/status` 的间隔（毫秒）。
+///
+/// 它只影响**发现延迟**（attach 后多久开始派 audiod），不影响上界。
+/// 取 20ms：相较 HDA 初始化的秒级耗时可忽略，又不至于密集占满调度。
+const AUDIO_ATTACH_POLL_MS: u64 = 20;
 
 /// 朴素子串查找（在 `hay` 中找 `needle`）。
 ///
@@ -387,20 +411,69 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     // `attached` 字段（A1 已如实披露该状态，S15 单一事实源），成立即派生。
     // 有界重试：无 HDA 设备时 intel-hda 会干净退出，此时**如实报告并跳过**
     // 生产者，而不是派生一个注定失败的进程。
+    // **等真实时间上界，不是等轮次**（见 AUDIO_ATTACH_WAIT_MS 的说明）。
+    //
+    // sleep 是必要的：纯 `yield_now()` 轮询在"无人竞争的短窗口"里会让出
+    // 整个调度轮却几乎不消耗墙钟时间，于是几十万轮也可能只覆盖几百毫秒——
+    // 这正是原实现失败的机制。`sleep` 走 SYS_TASK_WAIT，按真实时间返回。
     let mut attached = false;
-    for _ in 0..AUDIO_ATTACH_WAIT_ROUNDS {
-        if let Ok(st) = libsys::read_to_end("/devices/audio/dsp/status") {
-            // 只做最朴素的子串判定：JSON 里 "attached":true 即表示消费者已就位。
-            if contains(&st, b"\"attached\":true") {
-                attached = true;
-                break;
+    let mut waited_ms: u64 = 0;
+    // **如实区分三种结局**（S09）：读成功且 attached=true / 读成功但仍是 false /
+    // **读失败**。初版把最后一种与第二种混为一谈（`if let Ok` 直接丢弃 Err），
+    // 于是"路径不存在/读取被拒"在日志上表现为"设备没 attach"——实测正是这个
+    // 假象把排查引偏：驱动明明已 `[audio] pid=5 attached as PCM consumer`，
+    // init 却报 attached=false。此处记录最后一次读取的错误码与原文，使二者可分。
+    let mut last_err: Option<libsys::Error> = None;
+    let mut last_len: usize = 0;
+    while waited_ms < AUDIO_ATTACH_WAIT_MS {
+        match libsys::read_to_end("/devices/audio/dsp/status") {
+            Ok(st) => {
+                last_err = None;
+                last_len = st.len();
+                // 只做最朴素的子串判定：JSON 里 "attached":true 即表示消费者已就位。
+                if contains(&st, b"\"attached\":true") {
+                    attached = true;
+                    break;
+                }
             }
+            // 读失败：如实记下，不当作"未 attach"。
+            Err(e) => last_err = Some(e),
         }
-        let _ = libsys::yield_now();
+        let _ = libsys::sleep(AUDIO_ATTACH_POLL_MS * 1_000_000);
+        waited_ms += AUDIO_ATTACH_POLL_MS;
     }
     // 记录我们**实际观测到**的状态，而不是假定的状态（S09）。
+    //
+    // 【S09 补强】同时打印**等待了多久**。原实现只打印 true/false，于是
+    // "等了 15 秒仍无消费者"（设备真缺失）与"刚查一次就没等"（等待窗口
+    // 不足）在日志上**无法区分**——这正是本次缺陷被掩盖三周的原因。
+    // 带上耗时后，一眼即可判定是设备问题还是时序问题。
     let _ = write(STDOUT, b"[init] audio ring consumer attached = ");
-    let _ = write(STDOUT, if attached { b"true\n" } else { b"false\n" });
+    let _ = write(STDOUT, if attached { b"true" } else { b"false" });
+    let _ = write(STDOUT, b" (waited ");
+    {
+        // `waited_ms` 上界是 `AUDIO_ATTACH_WAIT_MS`（15_000），5 位十进制数；
+        // `dec_u64` 的契约是 8 字节缓冲，量级远小于 u64 上限，不会截断。
+        let mut buf = [0u8; 8];
+        let _ = write(STDOUT, dec_u64(waited_ms, &mut buf));
+    }
+    let _ = write(STDOUT, b"ms, last_len=");
+    {
+        let mut buf = [0u8; 8];
+        let _ = write(STDOUT, dec_u64(last_len as u64, &mut buf));
+    }
+    // 三种结局的第三种：**读取本身失败**。这是与"设备未 attach"截然不同的
+    // 事实，必须显式披露，否则排查会被引向错误的假设（本次即如此）。
+    match last_err {
+        None => {
+            let _ = write(STDOUT, b" err=none)\n");
+        }
+        Some(e) => {
+            let _ = write(STDOUT, b" err=");
+            let _ = write(STDOUT, err_name(e));
+            let _ = write(STDOUT, b")\n");
+        }
+    }
 
     // ---- 4.3.3.1 拉起混音守护进程 audiod（守护进程，保留常驻）----
     //
@@ -789,7 +862,27 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     }
 }
 
+/// `libsys::Error` 的**稳定文本名**，用于诊断输出。
+///
+/// 为什么不直接 `{:?}`：`Debug` 的表示形式属于实现细节，且 `no_std` 下
+/// 格式化路径体积可观。这里只映射本处实际可能遇到的几种，未知如实标 `Other`
+/// —— 不猜、不伪造（S09）。
+fn err_name(e: libsys::Error) -> &'static [u8] {
+    match e {
+        libsys::Error::NotFound => b"NotFound",
+        libsys::Error::PermissionDenied => b"PermissionDenied",
+        libsys::Error::InvalidParam => b"InvalidParam",
+        libsys::Error::WouldBlock => b"WouldBlock",
+        libsys::Error::NoSpace => b"NoSpace",
+        libsys::Error::Io => b"Io",
+        _ => b"Other",
+    }
+}
+
 /// 把无符号整数格式化为十进制字节，写入 `buf`，返回有效长度。
+///
+/// **契约**：`buf` 至少 20 字节（`u64` 的十进制上界）。内部用 20 字节中转，
+/// 写回时若 `buf` 偏小会按 `buf` 长度截断——调用方须按其值的量级选择缓冲。
 fn dec_u64(v: u64, buf: &mut [u8; 8]) -> &[u8] {
     let mut tmp = [0u8; 20];
     let mut n = v;
