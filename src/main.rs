@@ -160,13 +160,9 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     // 为何用 argv 而非环境变量：libsys 无 environ 支持，而 argv 是既有机制
     // （shell 的非交互模式同款），无需新增子系统。
     //
-    // 两个开关**相互独立**（曾经 selftest 挂在 skip-hda 下，那是因为 selftest 当时
-    // 只是「绕开 HDA 的 GPF」的附带产物；GPF 根因修复后两者已无因果关系，
-    // 继续耦合会让「跑 selftest」与「不启动 HDA」这两件不相干的事绑死）：
-    //   --skip-hda      ：不拉起 intel-hda（诊断用：隔离显示/音频侧影响）
+    // 运行期开关（`--skip-hda` 已随 intel-hda 启动步一并取消，见 4.3.2 说明）：
     //   --selftest      ：以非交互 shell 跑一遍 `selftest thread`（ADR-038 U1 入口）
-//   --selftest-quick：以非交互 shell 跑一遍 `selftest quick`（A2-5 账户查询 E2E 入口）
-    let mut skip_hda = false;
+    //   --selftest-quick：以非交互 shell 跑一遍 `selftest quick`（A2-5 账户查询 E2E 入口）
     let mut run_selftest = false;
     let mut run_selftest_quick = false;
     // --run=<命令行>：以非交互 shell 执行**任意**一条命令行（A2-4/A2-5 通用验收入口）。
@@ -177,8 +173,7 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
             // SAFETY: i < argc，argv 由内核 exec 路径按 C 数组构造，NUL 结尾。
             let p = unsafe { *argv.offset(i) };
             if !p.is_null() {
-                if arg_eq(p, b"--skip-hda") { skip_hda = true; }
-                else if arg_eq(p, b"--selftest") { run_selftest = true; }
+                if arg_eq(p, b"--selftest") { run_selftest = true; }
                 else if arg_eq(p, b"--selftest-quick") { run_selftest_quick = true; }
                 else if arg_starts_with(p, b"--run=") { run_cmd = Some(arg_rest(p, b"--run=")); }
             }
@@ -195,7 +190,6 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         for want in pre.split_ascii_whitespace() {
             if want == "--selftest" { run_selftest = true; }
             else if want == "--selftest-quick" { run_selftest_quick = true; }
-            else if want == "--skip-hda" { skip_hda = true; }
             else if let Some(rest) = want.strip_prefix("--run=") {
                 // 构建期常量是 &'static str，可直接借出。
                 run_cmd = Some(rest.as_bytes());
@@ -357,156 +351,33 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         }
     }
 
-    // 4.3.2 拉起阶段三 intel-hda（ICH6 HD Audio）用户态声卡驱动带起。
-    //    无 HDA 控制器（QEMU 未加 -device intel-hda）时驱动自查无设备并干净退出——
-    //    非致命。加 -device intel-hda 后驱动认领/复位/枚举 codec（阶段三带起）。
+    // 4.3.2 / 4.3.3 intel-hda（ICH6 HD Audio）用户态驱动与其后置的 audiod —— 已移除。
     //
-    // **可诊断性开关（ADR-038 U1 引入）**：以 argv 含 `--skip-hda` 启动 init 时跳过本步。
-    // 动机是实测踩到的一个**与本开关无关的既有缺陷**：`br --release`（注意：**不带**
-    // 任何 `--test-*`）时，intel-hda 在 `[uio] claim mapped ... -> user 0x101000000`
-    // 之后立刻触发 General Protection Fault（vector 0xd，rip 0xffffffff8007614d），
-    // 整个用户态启动因此停摆，永远到不了 shell。该缺陷在**暂存本工作全部改动后的
-    // 纯净检出**上以**同一 rip** 复现，故与本工作无关，属另一条独立线索。
+    // **移除理由（实测，2026-09）**：该驱动在**无 HDA 控制器**的启动配置下
+    // （即不传 `-device intel-hda`）不会「自查无设备并干净退出」，而是卡在内核态
+    // 永不返回：它以 pid 5 长期占据 `run.current`，而调度器的 IRQ0 tick 只在
+    // **用户态**边界做 RR 轮转（`tick` 顶部 `if frame.cs & 3 != 3 { return }`），
+    // 故一个卡在内核态的进程**永远不会被抢占**——pid 7（shell）与 pid 8（前台
+    // 子进程）双双停在 `Ready` 却永不获调度。
     //
-    // 加这个开关而不是直接改崩溃点：声卡驱动的 MMIO 复位序列需要真实设备语义，
-    // 不该为通过一项进程模型的验收而仓促改动；而本开关让**其它用户态路径**（含
-    // forkdemo 端到端验收）能在该缺陷修复前继续被验证。跳过时**如实打印**，
-    // 绝不静默（失败必须可见）。
-    if !skip_hda {
-    // `--quiet`：驱动本身默认会打 150 行 bring-up 取证（CORB/RIRB 轮询、
-            // codec 枚举、放大路由），足够淹没 shell 提示符。此处显式要求只留
-            // 结论行；需要逐步取证时去掉该参数单独跑驱动即可。
-            match libsys::exec_path("/programs/intel-hda.elf", b"--quiet") {
-        Ok(pid) => {
-            let mut buf = [0u8; 8];
-            let _ = write(STDOUT, b"[init] intel-hda started (pid ");
-            let _ = write(STDOUT, dec_u64(pid, &mut buf));
-            let _ = write(STDOUT, b")\n");
-        }
-        Err(_) => {
-            let _ = write(STDOUT, b"[init] exec_path(intel-hda.elf) failed (non-fatal)\n");
-        }
-        }
-    } else {
-        let _ = write(
-            STDOUT,
-            b"[init] intel-hda SKIPPED (--skip-hda; see ADR-038 U1 note on the pre-existing GPF)\n",
-        );
-    }
-
-    // 4.3.3 A3：拉起**音频流生产者**，把已知 PCM 写进 /devices/audio/dsp。
+    // 实测取证（QEMU monitor 冻结采样 + 内核 tick 探针，两者独立一致）：
+    //   - `cur=5` 在全部采样中恒定不变，而 `p7=Ready`、`p8=Ready` 反复出现；
+    //   - 前台 `^C` 的 SIGINT **确实**到达了 0x03 并被 shell 消费、kill 也发出了
+    //     （pending 位实测为 1），但信号派发只在「当前进程」上做，pid 8 永不为
+    //     当前进程，故 pending 永远挂着——表现为提示符永不回来。
     //
-    // **必须等 intel-hda 完成 attach()**：写入路径要求 ring 已有消费者，
-    // 无消费者时写入是**如实拒绝**（A1 的设计，不静默丢弃）。
+    // 现象与既有文档记录一致：`pic.rs` / `irq_owner.rs` 记载 intel-hda 实测
+    // 「整系统冻结于 `irq_restore+6`，IF=0，RIP 两秒纹丝不动」，与本次冻结现场
+    // 抓到的 RIP/RFLAGS 完全吻合。
     //
-    // 【修正】初版这里写的是 `for _ in 0..3000 { yield_now() }` 作为"等一会儿"。
-    // 实测证明那是**错的**：`yield_now()` 是一次完整的调度往返，3000 次要跑
-    // 好几分钟（每次都要让给 volumed/driverd 等所有就绪线程），实测日志里
-    // 出现 16927 行 yield syscall、生产者迟迟不启动，A3 流式几乎没跑起来。
+    // 因此**删除**本步（而不是继续用 `--skip-hda` 绕过）：保留一个默认会把系统
+    // 卡死的启动步骤，等于让每条默认路径都背负这条缺陷。`--skip-hda` 开关随之
+    // 取消（它唯一的用途就是绕开这里）。待 HDA 驱动的内核态不返回问题被单独
+    // 修复后，本步可连同 `--skip-hda` 一起恢复。
     //
-    // 更根本的问题是：**延时不是同步**。它既不保证 intel-hda 已经 attach，
-    // 也不在它 attach 后立即继续——纯属猜一个数字（S13），且不可验证（S20）。
-    //
-    // 现在改为**观测真实前置条件**：轮询 `/devices/audio/dsp/status` 的
-    // `attached` 字段（A1 已如实披露该状态，S15 单一事实源），成立即派生。
-    // 有界重试：无 HDA 设备时 intel-hda 会干净退出，此时**如实报告并跳过**
-    // 生产者，而不是派生一个注定失败的进程。
-    // **等真实时间上界，不是等轮次**（见 AUDIO_ATTACH_WAIT_MS 的说明）。
-    //
-    // sleep 是必要的：纯 `yield_now()` 轮询在"无人竞争的短窗口"里会让出
-    // 整个调度轮却几乎不消耗墙钟时间，于是几十万轮也可能只覆盖几百毫秒——
-    // 这正是原实现失败的机制。`sleep` 走 SYS_TASK_WAIT，按真实时间返回。
-    let mut attached = false;
-    let mut waited_ms: u64 = 0;
-    // **如实区分三种结局**（S09）：读成功且 attached=true / 读成功但仍是 false /
-    // **读失败**。初版把最后一种与第二种混为一谈（`if let Ok` 直接丢弃 Err），
-    // 于是"路径不存在/读取被拒"在日志上表现为"设备没 attach"——实测正是这个
-    // 假象把排查引偏：驱动明明已 `[audio] pid=5 attached as PCM consumer`，
-    // init 却报 attached=false。此处记录最后一次读取的错误码与原文，使二者可分。
-    let mut last_err: Option<libsys::Error> = None;
-    let mut last_len: usize = 0;
-    while waited_ms < AUDIO_ATTACH_WAIT_MS {
-        match libsys::read_to_end("/devices/audio/dsp/status") {
-            Ok(st) => {
-                last_err = None;
-                last_len = st.len();
-                // 只做最朴素的子串判定：JSON 里 "attached":true 即表示消费者已就位。
-                if contains(&st, b"\"attached\":true") {
-                    attached = true;
-                    break;
-                }
-            }
-            // 读失败：如实记下，不当作"未 attach"。
-            Err(e) => last_err = Some(e),
-        }
-        let _ = libsys::sleep(AUDIO_ATTACH_POLL_MS * 1_000_000);
-        waited_ms += AUDIO_ATTACH_POLL_MS;
-    }
-    // 记录我们**实际观测到**的状态，而不是假定的状态（S09）。
-    //
-    // 【S09 补强】同时打印**等待了多久**。原实现只打印 true/false，于是
-    // "等了 15 秒仍无消费者"（设备真缺失）与"刚查一次就没等"（等待窗口
-    // 不足）在日志上**无法区分**——这正是本次缺陷被掩盖三周的原因。
-    // 带上耗时后，一眼即可判定是设备问题还是时序问题。
-    let _ = write(STDOUT, b"[init] audio ring consumer attached = ");
-    let _ = write(STDOUT, if attached { b"true" } else { b"false" });
-    let _ = write(STDOUT, b" (waited ");
-    {
-        // `waited_ms` 上界是 `AUDIO_ATTACH_WAIT_MS`（15_000），5 位十进制数；
-        // `dec_u64` 的契约是 8 字节缓冲，量级远小于 u64 上限，不会截断。
-        let mut buf = [0u8; 8];
-        let _ = write(STDOUT, dec_u64(waited_ms, &mut buf));
-    }
-    let _ = write(STDOUT, b"ms, last_len=");
-    {
-        let mut buf = [0u8; 8];
-        let _ = write(STDOUT, dec_u64(last_len as u64, &mut buf));
-    }
-    // 三种结局的第三种：**读取本身失败**。这是与"设备未 attach"截然不同的
-    // 事实，必须显式披露，否则排查会被引向错误的假设（本次即如此）。
-    match last_err {
-        None => {
-            let _ = write(STDOUT, b" err=none)\n");
-        }
-        Some(e) => {
-            let _ = write(STDOUT, b" err=");
-            let _ = write(STDOUT, err_name(e));
-            let _ = write(STDOUT, b")\n");
-        }
-    }
-
-    // ---- 4.3.3.1 拉起混音守护进程 audiod（守护进程，保留常驻）----
-    //
-    // **audiod 是 dsp 的写者，不是消费者，故不调 AUDIO_ATTACH**（实测修正，
-    // 见 audiod/src/main.rs 顶部说明）。它只需 dsp 上**已有**消费者——
-    // 即 intel-hda 已 attach 占位。
-    //
-    // 顺序约束：audiod 必须排在 intel-hda **之后**（否则 dsp 无人消费，
-    // audiod 写入会被如实拒绝）。
-    //
-    // 原 8 MiB x2 路 stream 生产者与 fpcheck 已移入 `selftest` 命令：
-    // 它们是**有界的测试负载**（2 x 44s 实时播放 + FP 演示），不是服务——
-    // 开机必跑会让 shell 迟到两三分钟（用户实测）。audiod 只 attach/待命，
-    // 不产生声音，留在开机序列里没有代价。
-    if !attached {
-        // 如实说明：没有消费者时 audiod 的写入会被拒，跳过派生（honest skip）。
-        let _ = write(
-            STDOUT,
-            b"[init] no audio consumer (no HDA device?); skipping audiod (honest skip)\n",
-        );
-    } else {
-        match libsys::exec_path("/programs/audiod.elf", b"") {
-            Ok(pid) => {
-                let mut buf = [0u8; 8];
-                let _ = write(STDOUT, b"[init] audiod started (pid ");
-                let _ = write(STDOUT, dec_u64(pid, &mut buf));
-                let _ = write(STDOUT, b")\n");
-            }
-            Err(_) => {
-                let _ = write(STDOUT, b"[init] exec_path(audiod.elf) failed (non-fatal)\n");
-            }
-        }
-    }
+    // 相关但**不受影响**的部分：`/devices/audio/dsp` 设备节点、`audiod` 与
+    // `audiofile` 用户程序、以及 `selftest` 里的音频用例都仍在仓库中，只是不再
+    // 由 init 在开机序列里拉起（无消费者时 audiod 的写入本就会被如实拒绝）。
 
     // 4.4.1 T1-8：端到端同进程双线程示例（threaddemo）。放风暴前执行并专候收尸，
     //    使风暴的 waitpid_any 不会误收 threaddemo 的僵尸。
