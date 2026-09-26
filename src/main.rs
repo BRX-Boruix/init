@@ -832,14 +832,18 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         // 恢复在场，下一个 login/shell 不会再永久阻塞在空环上。
         //
         // 查找走 libsys::pid_of_name（JSON 精确全等，S13：不做子串猜谜）。
-        // 无条件 exec 不可行：consoled 存活时重复 spawn = 双生产者交错写环，
-        // 比「守护死了」更糟（S20）。spawn 失败如实打印并继续（下周期再试）。
+        // **名字必须是 procfs 的真实形态**：`/processes/list` 的 `name` 字段是
+        // 程序文件名**含 .elf**（如 "init.elf"，见 procfs.rs）——传 "consoled"
+        // 会永远 miss → 每周期误判死亡 → 误开第二实例（双生产者交错写环，
+        // S20 最忌形态；wd13 实测复现了这一错误）。无条件 exec 不可行：consoled
+        // 存活时重复 spawn = 双生产者交错写环，比「守护死了」更糟（S20）。
+        // spawn 失败如实打印并继续（下周期再试）。
         {
             let alive = libsys::read_to_end("/processes/list")
                 .ok()
                 .and_then(|data| {
                     let text = core::str::from_utf8(&data).ok()?;
-                    libsys::pid_of_name(text, "consoled")
+                    libsys::pid_of_name(text, "consoled.elf")
                 })
                 .is_some();
             if !alive {
