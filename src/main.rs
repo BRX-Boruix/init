@@ -683,6 +683,33 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         }
     }
 
+    // 4.9.5 I-EVENTS P4 单径切换（§6.15，裁决甲-a）：启动 consoled——
+    // stdin 字节源从此是 console 环，搬运者是本守护（事件流 → libsys
+    // keymap → /devices/console）。**必须先于 login**：login/shell 的第一个
+    // stdin 读就阻塞在 CONSOLE_WAITER 上，生产者不在场 = 终端永久无输入。
+    //
+    // S20 失败模式：spawn 失败如实报告（non-fatal 打印）——但**不回退**到旧
+    // 键盘直读路径（单径切换，不采渐进组合）：回退会让「有/无 consoled」
+    // 成为隐式双径，违背 S15 单一事实源。守护崩溃 → supervisor 循环不复活它
+    // （ resurrection 归属 P6 评估，此处如实留痕）。
+    //
+    // 开机窗口竞态：consoled 起来之前用户敲的键滞留事件环（P1 多读者
+    // backlog 兜底），consoled 起来后按序转换——不丢键，只延迟。
+    match libsys::exec_path("/programs/consoled.elf", b"") {
+        Ok(pid) => {
+            let mut buf = [0u8; 8];
+            let _ = write(STDOUT, b"[init] consoled started (pid ");
+            let _ = write(STDOUT, dec_u64(pid, &mut buf));
+            let _ = write(STDOUT, b")\n");
+        }
+        Err(_) => {
+            let _ = write(
+                STDOUT,
+                b"[init] exec_path(consoled.elf) failed; stdin has NO producer (terminal dead)\n",
+            );
+        }
+    }
+
     // 4.10 A2-7（ADR-041 §1.3）：以 `login` 做**认证关口**，通过后才进入交互 shell。
     //
     // 【为何在 init 里做这一手】内核 `exec_path` 语义是**继承**父进程身份，没有"以指定
