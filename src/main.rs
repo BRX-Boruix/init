@@ -825,6 +825,41 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     // 结构纪律：`exec` 属于**重生**动作，必须在等待循环**之外**；等待循环内
     // 只允许两类出口 —— 继续等（孤儿/瞬时失败）或跳出重生（会话真死了）。
     loop {
+        // ---- consoled 看门狗（I-EVENTS §6.15.6 遗留 #6，2026-09-27）----
+        // 每个 getty 周期先检查 consoled 是否存活：不在 → 重新拉起。守护崩溃
+        // 的**会话内**窗口无法治愈（init 正阻塞在 waitpid_any，无人巡检——
+        // 如实边界），但**会话结束后的下一个周期**必然自愈：stdin 生产者
+        // 恢复在场，下一个 login/shell 不会再永久阻塞在空环上。
+        //
+        // 查找走 libsys::pid_of_name（JSON 精确全等，S13：不做子串猜谜）。
+        // 无条件 exec 不可行：consoled 存活时重复 spawn = 双生产者交错写环，
+        // 比「守护死了」更糟（S20）。spawn 失败如实打印并继续（下周期再试）。
+        {
+            let alive = libsys::read_to_end("/processes/list")
+                .ok()
+                .and_then(|data| {
+                    let text = core::str::from_utf8(&data).ok()?;
+                    libsys::pid_of_name(text, "consoled")
+                })
+                .is_some();
+            if !alive {
+                match libsys::exec_path("/programs/consoled.elf", b"") {
+                    Ok(pid) => {
+                        let mut buf = [0u8; 8];
+                        let _ = write(STDOUT, b"[init] consoled was dead; respawned (pid ");
+                        let _ = write(STDOUT, dec_u64(pid, &mut buf));
+                        let _ = write(STDOUT, b")\n");
+                    }
+                    Err(_) => {
+                        let _ = write(
+                            STDOUT,
+                            b"[init] consoled respawn FAILED; terminal stays dead this cycle\n",
+                        );
+                    }
+                }
+            }
+        }
+
         // ---- 重生点：只有走到这里才拉起新 login（认证关口）----
         let session_pid: u64 = loop {
             match libsys::exec_path("/programs/login.elf", &[]) {
