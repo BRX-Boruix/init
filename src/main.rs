@@ -26,6 +26,31 @@ const CONSOLES_N: usize = match option_env!("BORUIX_CONSOLES_N") {
     None => 4,
 };
 
+/// 会话模式（ADR-048 扩展 E3）：serial = 既有轮转形态（默认，零变化）；
+/// parallel = 每实例一个 login/shell 同时在场（会话账本对账重生）。
+const SESSION_MODE_PARALLEL: bool = match option_env!("BORUIX_SESSION_MODE") {
+    // const 上下文不能对 &str/[u8] 判等（PartialEq 未 const 稳定）——手写
+    // const fn 字节循环比对（const_parse_usize 同款纯 const 形态，S13）。
+    Some(s) if const_str_eq(s, "parallel") => true,
+    _ => false,
+};
+
+/// const 上下文的 &str 判等（PartialEq 未 const 稳定，手写循环）。
+const fn const_str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// const 上下文十进制解析（与 vfs/src/console.rs 同款防御，S17）。
 const fn const_parse_usize(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
@@ -820,6 +845,9 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         // 重生目标写成 shell，等于"认证未通过仍给了 shell"（实测：连续 6 次空
         // 回车 → 3 次尝试耗尽 → 直接得到 uid 0 的交互 shell，认证关口完全旁路），
         // 现已修复并记入 ADR-041 §1.3 / R13。
+        // E3：parallel 模式下开机**不**做首单会话——N 个 getty 全部由
+        // supervisor 会话账本拉起（每实例一个，结构单点 S13）；serial 保持。
+        if !SESSION_MODE_PARALLEL {
         match libsys::exec_path("/programs/login.elf", &[]) {
             Ok(pid) => {
                 let mut buf = [0u8; 8];
@@ -852,6 +880,7 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
                 let _ = write(STDOUT, b"[init] exec_path(login.elf) failed\n");
             }
         }
+        } // E3: serial-only 首会话
         // **认证关口语义（关键）**：login 内部认证成功后，会在**自己的**进程里降权并
         // exec shell —— 也就是说成功的会话**不会**回到这里。因此走到本行即意味着
         // login 是失败退出（3 次机会耗尽）或无法启动。此时 init 的身份是上面设的
@@ -882,6 +911,109 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     //
     // 结构纪律：`exec` 属于**重生**动作，必须在等待循环**之外**；等待循环内
     // 只允许两类出口 —— 继续等（孤儿/瞬时失败）或跳出重生（会话真死了）。
+
+    // ---- E3：parallel 会话模式（ADR-048 扩展，owner 指令「并行多会话」）----
+    // 结构：**专属循环**（与 serial 的 loop 并列，单径 S13——不用模式分支搅在
+    // serial 循环里）。开机一次性 spawn N 个 login（argv=i，i=0..N），入
+    // **会话账本** [(instance, pid); CONSOLES_N]；收尸 waitpid_any → 按 pid
+    // 对账 → 命中即**原位重生同实例** login（账本原位更新），未命中 = 孤儿
+    // （过继收尸，语义与 serial 相同）。
+    // 焦点语义（诚实边界，S20 先行）：parallel 下 getty 重生即焦点转移
+    //（login 认证前 focus_set），焦点恒单点；多物理终端的用户态切换器
+    // 留 E4（本版不做，ADR-048 §4 记录）。
+    if SESSION_MODE_PARALLEL {
+        let mut sessions: [(u64, u64); CONSOLES_N] = [(0, 0); CONSOLES_N]; // (instance, pid)
+        let mut spawned: usize = 0;
+        for inst in 0..CONSOLES_N {
+            let mut ib = [0u8; 8];
+            let arg = dec_u64(inst as u64, &mut ib);
+            match libsys::exec_path("/programs/login.elf", arg) {
+                Ok(pid) => {
+                    let mut buf = [0u8; 8];
+                    let _ = write(STDOUT, b"[init] parallel session started (pid ");
+                    let _ = write(STDOUT, dec_u64(pid, &mut buf));
+                    let _ = write(STDOUT, b" instance ");
+                    let _ = write(STDOUT, dec_u64(inst as u64, &mut buf));
+                    let _ = write(STDOUT, b")\n");
+                    sessions[spawned] = (inst as u64, pid);
+                    spawned += 1;
+                }
+                Err(_) => {
+                    let _ = write(
+                        STDOUT,
+                        b"[init] parallel login spawn failed; instance getty missing\n",
+                    );
+                }
+            }
+        }
+        // parallel 主循环：只等 + 对账重生（看门狗复用 serial 同款巡检——
+        // 守护账本巡检是无状态的，每轮跑一次即可，直接内联同一段）。
+        loop {
+            match waitpid_any() {
+                Ok(wr) => {
+                    // 对账：退出 pid 在账本里 → 该实例会话死了，原位重生。
+                    let mut hit: Option<usize> = None;
+                    for i in 0..spawned {
+                        if sessions[i].1 == wr.pid {
+                            hit = Some(i);
+                            break;
+                        }
+                    }
+                    match hit {
+                        Some(i) => {
+                            let inst = sessions[i].0;
+                            let mut buf = [0u8; 8];
+                            let _ = write(STDOUT, b"[init] parallel session ended (code ");
+                            let _ = write(STDOUT, dec_u64(wr.code, &mut buf));
+                            let _ = write(STDOUT, b") on instance ");
+                            let _ = write(STDOUT, dec_u64(inst, &mut buf));
+                            let _ = write(STDOUT, b"; respawning\n");
+                            // 原位重生（重生动作在收尸分支内联——parallel 结构
+                            // 与 serial 的「exec 在等待循环外」不同：这里等待与
+                            // 重生同循环，账本即结构，不存在旧 #6 的「收尸即重开
+                            // shell」形态，因为重生目标恒为 login 且按实例对账）。
+                            let mut ib = [0u8; 8];
+                            let arg = dec_u64(inst, &mut ib);
+                            match libsys::exec_path("/programs/login.elf", arg) {
+                                Ok(pid) => {
+                                    let mut buf = [0u8; 8];
+                                    let _ = write(STDOUT, b"[init] parallel session started (pid ");
+                                    let _ = write(STDOUT, dec_u64(pid, &mut buf));
+                                    let _ = write(STDOUT, b" instance ");
+                                    let _ = write(STDOUT, dec_u64(inst, &mut buf));
+                                    let _ = write(STDOUT, b")\n");
+                                    sessions[i].1 = pid;
+                                }
+                                Err(_) => {
+                                    // 重生失败：账本条目 pid 置 0 = 该实例 getty
+                                    // 缺位（不再自动重试——下次该实例收尸不会命中。
+                                    // 如实边界：getty 拉不起时该终端静默缺位，
+                                    // ADR-048 §4 记录，E4 改进巡检重生）。
+                                    sessions[i].1 = 0;
+                                    let _ = write(
+                                        STDOUT,
+                                        b"[init] parallel respawn failed; instance getty missing\n",
+                                    );
+                                }
+                            }
+                        }
+                        None => {
+                            // 孤儿（非会话进程）：过继收尸，继续等。
+                            let mut buf = [0u8; 8];
+                            let _ = write(STDOUT, b"[init] reaped orphan (code ");
+                            let _ = write(STDOUT, dec_u64(wr.code, &mut buf));
+                            let _ = write(STDOUT, b"), continuing\n");
+                        }
+                    }
+                }
+                Err(_) => {
+                    // 无就绪者：短眠（与 serial 同款，绝不忙转）。
+                    let _ = libsys::sleep(100_000_000);
+                }
+            }
+        }
+    }
+
     loop {
         // ---- consoled 看门狗（I-EVENTS §6.15.6 遗留 #6，2026-09-27）----
         // 每个 getty 周期先检查 consoled 是否存活：不在 → 重新拉起。守护崩溃

@@ -35,4 +35,16 @@ fn main() {
         .unwrap_or(4);
     let n = n.clamp(1, 256);
     println!("cargo:rustc-env=BORUIX_CONSOLES_N={}", n);
+
+    // ADR-048 扩展 E3（owner 指令「并行多会话」）：会话模式构建期开关——
+    // serial（默认，=T5 既有轮转形态，零变化判据）| parallel（每实例一个
+    // login/shell 同时在场，getty 重生即焦点转移）。为什么构建期：模式决定
+    // supervisor 的结构（串行等待 vs 账本对账），不是可调参数。
+    println!("cargo:rerun-if-env-changed=BORUIX_SESSION_MODE");
+    let mode = std::env::var("BORUIX_SESSION_MODE").unwrap_or_default();
+    let mode = match mode.as_str() {
+        "parallel" => "parallel",
+        _ => "serial",
+    };
+    println!("cargo:rustc-env=BORUIX_SESSION_MODE={}", mode);
 }
