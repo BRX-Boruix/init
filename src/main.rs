@@ -14,6 +14,37 @@
 
 use libsys::{brk, info, waitpid_any, write, yield_now, STDOUT};
 
+/// console 实例总数（ADR-048 扩展 E1，owner 指令 2026-09-27）：构建期经
+/// `BORUIX_CONSOLES_N` 注入（init/build.rs，默认 4、钳 1..=256），与内核
+/// vfs 侧（vfs/build.rs）**同源同值**——devfs 挂几个实例，init 就供几个
+/// 守护与几个轮转位（S13：一个数字一个真相来源）。防御性二次钳同 vfs。
+const CONSOLES_N: usize = match option_env!("BORUIX_CONSOLES_N") {
+    Some(s) => match const_parse_usize(s) {
+        Some(n) if n >= 1 && n <= 256 => n,
+        _ => 4,
+    },
+    None => 4,
+};
+
+/// const 上下文十进制解析（与 vfs/src/console.rs 同款防御，S17）。
+const fn const_parse_usize(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut n: usize = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c < b'0' || c > b'9' {
+            return None;
+        }
+        n = n * 10 + (c - b'0') as usize;
+        i += 1;
+    }
+    Some(n)
+}
+
 /// 把无符号整数格式化为十六进制字符串（写入固定缓冲），返回有效切片。
 ///
 /// 缓冲布局：`buf[0..2] = "0x"`，`buf[2..18]` 为 16 个 hex 位（高位在前）。
@@ -701,7 +732,7 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     // 硬编码 argc=1），consoled parse_instance 读 argv[0] 解析实例 id。
     // 守护账本：定长栈数组（S31：init 零堆依赖——no_std 且未链 alloc，
     // 不为此引入堆）。容量 = 实例上限（ADR-048 N=4），账本只会更短。
-    let mut consoled_ledger: [(usize, u64); 4] = [(0, 0); 4];
+    let mut consoled_ledger: [(usize, u64); CONSOLES_N] = [(0, 0); CONSOLES_N];
     let mut consoled_n: usize = 0;
     // T5-b（owner 裁决 B）：**每实例一守护**——事件流是广播语义（P1 多读者
     // 各持游标看全量），consoled[N] 各读全量事件、写环 N；非焦点实例的写被
@@ -709,7 +740,7 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     // 单点决定（S13）。守护崩溃由看门狗按账本巡检重生（T4 机制复用）。
     {
         let mut ib = [0u8; 8];
-        for inst in 0..2usize {
+        for inst in 0..CONSOLES_N {
             let arg = dec_u64(inst as u64, &mut ib);
             match libsys::exec_path("/programs/consoled.elf", arg) {
                 Ok(pid) => {
@@ -930,8 +961,9 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
                     let _ = write(STDOUT, dec_u64(session_turn, &mut buf));
                     let _ = write(STDOUT, b")\n");
                     // spawn 即绑定：轮转指针在本会话已被占用，翻转为下一实例。
-                    // （覆盖开机首会话与循环内重生两条路径，无特判，S13。）
-                    session_turn = (session_turn + 1) % 2;
+                    // （覆盖开机首会话与循环内重生两条路径，无特判，S13；
+                    // E1：轮转位 = CONSOLES_N，与实例族同宽。）
+                    session_turn = (session_turn + 1) % CONSOLES_N as u64;
                     break pid;
                 }
                 Err(_) => {
@@ -974,9 +1006,6 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
                         let _ = write(STDOUT, b"[init] session ended (code ");
                         let _ = write(STDOUT, dec_u64(wr.code, &mut buf));
                         let _ = write(STDOUT, b"), respawning login\n");
-                        // T5-c：会话轮转——下一会话服务另一实例（0↔1 交替；
-                        // N=2 轮转，实例 2..N-1 为未来扩展保留）。
-                        session_turn = (session_turn + 1) % 2;
                         break;
                     }
                 }

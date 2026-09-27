@@ -23,4 +23,16 @@ fn main() {
     if let Ok(extra) = std::env::var("BORUIX_INIT_ARGS") {
         println!("cargo:rustc-env=BORUIX_INIT_ARGS={}", extra);
     }
+
+    // ADR-048 扩展 E1（owner 指令 2026-09-27）：console 实例总数与内核 vfs 侧
+    // 同源注入（vfs/build.rs 同款钳位 1..=256、默认 4）——init 的守护 spawn
+    // 循环与会话轮转位跟 N 走，与 devfs 挂载的实例族形状**同源对齐**（S13：
+    // 同一个数字只允许一个真相来源，两侧从同一个 env 读）。
+    println!("cargo:rerun-if-env-changed=BORUIX_CONSOLES_N");
+    let n: u32 = std::env::var("BORUIX_CONSOLES_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    let n = n.clamp(1, 256);
+    println!("cargo:rustc-env=BORUIX_CONSOLES_N={}", n);
 }
