@@ -703,22 +703,39 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     // 不为此引入堆）。容量 = 实例上限（ADR-048 N=4），账本只会更短。
     let mut consoled_ledger: [(usize, u64); 4] = [(0, 0); 4];
     let mut consoled_n: usize = 0;
-    match libsys::exec_path("/programs/consoled.elf", b"0") {
-        Ok(pid) => {
-            let mut buf = [0u8; 8];
-            let _ = write(STDOUT, b"[init] consoled started (pid ");
-            let _ = write(STDOUT, dec_u64(pid, &mut buf));
-            let _ = write(STDOUT, b")\n");
-            consoled_ledger[consoled_n] = (0, pid);
-            consoled_n += 1;
-        }
-        Err(_) => {
-            let _ = write(
-                STDOUT,
-                b"[init] exec_path(consoled.elf) failed; stdin has NO producer (terminal dead)\n",
-            );
+    // T5-b（owner 裁决 B）：**每实例一守护**——事件流是广播语义（P1 多读者
+    // 各持游标看全量），consoled[N] 各读全量事件、写环 N；非焦点实例的写被
+    // 内核焦点过滤拒绝（Ok(0) + focus_dropped 计数），字节进哪个环由焦点
+    // 单点决定（S13）。守护崩溃由看门狗按账本巡检重生（T4 机制复用）。
+    {
+        let mut ib = [0u8; 8];
+        for inst in 0..2usize {
+            let arg = dec_u64(inst as u64, &mut ib);
+            match libsys::exec_path("/programs/consoled.elf", arg) {
+                Ok(pid) => {
+                    let mut buf = [0u8; 8];
+                    let _ = write(STDOUT, b"[init] consoled started (pid ");
+                    let _ = write(STDOUT, dec_u64(pid, &mut buf));
+                    let _ = write(STDOUT, b")\n");
+                    consoled_ledger[consoled_n] = (inst, pid);
+                    consoled_n += 1;
+                }
+                Err(_) => {
+                    let _ = write(
+                        STDOUT,
+                        b"[init] exec_path(consoled.elf) failed; stdin has NO producer (terminal dead)\n",
+                    );
+                }
+            }
         }
     }
+
+    // T5-c（ADR-048，owner 裁决 B）：会话实例**轮转**——单会话串行语义不变
+    //（waitpid 收尾才开下一会话），轮转让两块「终端」轮流得到 getty 服务；
+    // 焦点随 login 的认证前认领切到对应实例。开机首会话（上面无 argv 的
+    // spawn）隐式占实例 0（兼容形态零变化），故轮转指针初值 = 1：supervisor
+    // 的第一个重生即服务实例 1，此后 0↔1 交替。
+    let mut session_turn: u64 = 1;
 
     // 4.10 A2-7（ADR-041 §1.3）：以 `login` 做**认证关口**，通过后才进入交互 shell。
     //
@@ -899,13 +916,22 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         }
 
         // ---- 重生点：只有走到这里才拉起新 login（认证关口）----
+        // T5-c：argv = 轮转实例号（loader argv 雏形 argc=1）——login 绑定
+        // 该实例的终端并认领焦点（认证前 getty 独占键盘形态，Unix 同构）。
+        let mut turnbuf = [0u8; 8];
+        let login_arg = dec_u64(session_turn, &mut turnbuf);
         let session_pid: u64 = loop {
-            match libsys::exec_path("/programs/login.elf", &[]) {
+            match libsys::exec_path("/programs/login.elf", login_arg) {
                 Ok(pid) => {
                     let mut buf = [0u8; 8];
                     let _ = write(STDOUT, b"[init] login started (pid ");
                     let _ = write(STDOUT, dec_u64(pid, &mut buf));
+                    let _ = write(STDOUT, b" instance ");
+                    let _ = write(STDOUT, dec_u64(session_turn, &mut buf));
                     let _ = write(STDOUT, b")\n");
+                    // spawn 即绑定：轮转指针在本会话已被占用，翻转为下一实例。
+                    // （覆盖开机首会话与循环内重生两条路径，无特判，S13。）
+                    session_turn = (session_turn + 1) % 2;
                     break pid;
                 }
                 Err(_) => {
@@ -948,6 +974,9 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
                         let _ = write(STDOUT, b"[init] session ended (code ");
                         let _ = write(STDOUT, dec_u64(wr.code, &mut buf));
                         let _ = write(STDOUT, b"), respawning login\n");
+                        // T5-c：会话轮转——下一会话服务另一实例（0↔1 交替；
+                        // N=2 轮转，实例 2..N-1 为未来扩展保留）。
+                        session_turn = (session_turn + 1) % 2;
                         break;
                     }
                 }
