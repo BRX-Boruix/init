@@ -695,12 +695,22 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     //
     // 开机窗口竞态：consoled 起来之前用户敲的键滞留事件环（P1 多读者
     // backlog 兜底），consoled 起来后按序转换——不丢键，只延迟。
-    match libsys::exec_path("/programs/consoled.elf", b"") {
+    // ADR-048 决策 4（T4）：一实例一守护。spawn 带实例 argv（"0"），返回
+    // pid 入**守护账本**——看门狗（supervisor 循环）按账本逐实例巡检。
+    // cmd="0" 经 loader argv 雏形 = argc1/argv[0]="0"（loader lib.rs:864-866
+    // 硬编码 argc=1），consoled parse_instance 读 argv[0] 解析实例 id。
+    // 守护账本：定长栈数组（S31：init 零堆依赖——no_std 且未链 alloc，
+    // 不为此引入堆）。容量 = 实例上限（ADR-048 N=4），账本只会更短。
+    let mut consoled_ledger: [(usize, u64); 4] = [(0, 0); 4];
+    let mut consoled_n: usize = 0;
+    match libsys::exec_path("/programs/consoled.elf", b"0") {
         Ok(pid) => {
             let mut buf = [0u8; 8];
             let _ = write(STDOUT, b"[init] consoled started (pid ");
             let _ = write(STDOUT, dec_u64(pid, &mut buf));
             let _ = write(STDOUT, b")\n");
+            consoled_ledger[consoled_n] = (0, pid);
+            consoled_n += 1;
         }
         Err(_) => {
             let _ = write(
@@ -839,26 +849,50 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         // 存活时重复 spawn = 双生产者交错写环，比「守护死了」更糟（S20）。
         // spawn 失败如实打印并继续（下周期再试）。
         {
-            let alive = libsys::read_to_end("/processes/list")
-                .ok()
-                .and_then(|data| {
-                    let text = core::str::from_utf8(&data).ok()?;
-                    libsys::pid_of_name(text, "consoled.elf")
-                })
-                .is_some();
-            if !alive {
-                match libsys::exec_path("/programs/consoled.elf", b"") {
+            // ADR-048 决策 4（T4）：按**守护账本**逐实例巡检——账本里每个
+            // (instance, pid)，pid 已不在 /processes/list = 该实例守护死了，
+            // 按**同一实例号** respawn（守护与实例一一对应，绝不串号）。
+            // 僵尸由本循环 waitpid_any 收尸后从 procfs 消失，故「不在表」是
+            // 真死亡的可观测判据（与 #6 看门狗同一真值源）。
+            // procfs 快照：owned Vec 活到本巡检块结束（&str 借用随之合法，
+            // no_std 无 alloc String，S31）。
+            let procs_data = libsys::read_to_end("/processes/list").ok();
+            let procs_text: Option<&str> = procs_data
+                .as_deref()
+                .and_then(|data| core::str::from_utf8(data).ok());
+            let mut idx = 0usize;
+            while idx < consoled_n {
+                let (inst, pid) = consoled_ledger[idx];
+                let alive = procs_text
+                    .as_deref()
+                    .map(|t| libsys::pid_of_name_alive(t, "consoled.elf", pid))
+                    .unwrap_or(false);
+                if alive {
+                    idx += 1;
+                    continue;
+                }
+                // 死守护：按实例号 respawn（argv = 实例 id 十进制；argv 雏形
+                // argc=1，loader 硬编码）。
+                let mut argbuf = [0u8; 8];
+                let arg = dec_u64(inst as u64, &mut argbuf);
+                match libsys::exec_path("/programs/consoled.elf", arg) {
                     Ok(pid) => {
                         let mut buf = [0u8; 8];
                         let _ = write(STDOUT, b"[init] consoled was dead; respawned (pid ");
                         let _ = write(STDOUT, dec_u64(pid, &mut buf));
                         let _ = write(STDOUT, b")\n");
+                        // 账本原位更新：旧 pid 已死，新 pid 接管同一实例。
+                        consoled_ledger[idx] = (inst, pid);
+                        idx += 1;
                     }
                     Err(_) => {
+                        // respawn 失败：如实打印；**账本项保留**（下周期再试），
+                        // idx 前进避免本轮死循环（失败不影响其他实例巡检）。
                         let _ = write(
                             STDOUT,
                             b"[init] consoled respawn FAILED; terminal stays dead this cycle\n",
                         );
+                        idx += 1;
                     }
                 }
             }
