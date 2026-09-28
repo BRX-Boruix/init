@@ -621,7 +621,7 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     // 4.0 数据盘内容自检：证明 disk.img 的文件**真能被读出**，而不只是挂上了。
     //
     // 挂载成功只说明 EXT2 超级块可解析；内容是否正确取决于 SDK 写入路径
-    // （sdk/diskfiles -> mkimg -> disk.img）与内核读取路径是否真的对上。
+    // （tools/diskfiles -> mkimg -> disk.img）与内核读取路径是否真的对上。
     // 二者中间的任一处出错，"挂载成功"都会照样打印。故此处实读一个文件。
     //
     // 盘可能不存在（未挂 -drive），故失败只如实记录，不阻断启动。
