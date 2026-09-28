@@ -1175,6 +1175,27 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         // 现已修复并记入 ADR-041 §1.3 / R13。
         // E3：parallel 模式下开机**不**做首单会话——N 个 getty 全部由
         // supervisor 会话账本拉起（每实例一个，结构单点 S13）；serial 保持。
+        // B3-C2/B2 修复（S13/S20）：请求目录创建移到会话模式分支之前的
+        // 公共路径——此前误放在 serial 首-login 等待之后：serial 模式下
+        // login 存活期间该行不可达，openvt create 撞父目录缺失（系统盘
+        // 验证实证 NotFound）。
+        if let Err(e) = libsys::mkdir(CONSOLE_REQUESTS_DIR, libsys::Permissions::all()) {
+            if e != libsys::Error::AlreadyExists {
+                let _ = write(STDOUT, b"[init] WARN: mkdir console-requests failed: ");
+                let mut eb = [0u8; 8];
+                let _ = write(
+                    STDOUT,
+                    dec_u64(match e {
+                        libsys::Error::PermissionDenied => 13,
+                        libsys::Error::NotFound => 2,
+                        _ => 9,
+                    }, &mut eb),
+                );
+                let _ = write(STDOUT, b"\n");
+            }
+        } else {
+            let _ = write(STDOUT, b"[init] console-requests dir created\n");
+        }
         if !SESSION_MODE_PARALLEL {
         match libsys::exec_path("/programs/login.elf", &[]) {
             Ok(pid) => {
@@ -1249,14 +1270,6 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     // 焦点语义（诚实边界，S20 先行）：parallel 下 getty 重生即焦点转移
     //（login 认证前 focus_set），焦点恒单点；多物理终端的用户态切换器
     // 留 E4（本版不做，ADR-048 §4 记录）。
-    // B3-C2: create the request dir once (idempotent; AlreadyExists ignored).
-    // Without it, user create of a request file fails on missing parent.
-    // Serial mode gets it too: one protocol for both modes (S13).
-    let _ = libsys::mkdir(
-        CONSOLE_REQUESTS_DIR,
-        libsys::Permissions::all(),
-    );
-
     if SESSION_MODE_PARALLEL {
         let mut sessions: [(u64, u64); CONSOLES_MAX] = [(0, 0); CONSOLES_MAX]; // (instance, pid)
         let mut spawned: usize = 0;
