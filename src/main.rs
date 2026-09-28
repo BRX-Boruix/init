@@ -14,10 +14,12 @@
 
 use libsys::{brk, info, waitpid_any, waitpid_any_timeout, write, yield_now, STDOUT};
 
-/// console 实例总数（ADR-048 扩展 E1，owner 指令 2026-09-27）：构建期经
-/// `BORUIX_CONSOLES_N` 注入（init/build.rs，默认 4、钳 1..=256），与内核
-/// vfs 侧（vfs/build.rs）**同源同值**——devfs 挂几个实例，init 就供几个
-/// 守护与几个轮转位（S13：一个数字一个真相来源）。防御性二次钳同 vfs。
+/// console **开机预创建实例数**（ADR-048 扩展 E1；B3-C4 语义迁移：
+/// 从「实例总数」改为「开机预创建数」——运行期实例由 openvt 请求经
+/// init 巡检创建，硬上限 CONSOLES_MAX=64）：构建期经 `BORUIX_CONSOLES_N`
+/// 注入（init/build.rs，默认 4、钳 1..=256），与内核 vfs 侧（vfs/build.rs）
+/// **同源同值**——devfs 预创建几个实例，init 就供几个守护与几个轮转位
+/// （S13：一个数字一个真相来源）。防御性二次钳同 vfs。
 const CONSOLES_N: usize = match option_env!("BORUIX_CONSOLES_N") {
     Some(s) => match const_parse_usize(s) {
         Some(n) if n >= 1 && n <= 256 => n,
