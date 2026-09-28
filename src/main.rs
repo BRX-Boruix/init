@@ -12,7 +12,7 @@
 // 宿主程序）。迁移完成后删除本允许，恢复“死代码即错误”的纪律。
 #![allow(dead_code)]
 
-use libsys::{brk, info, waitpid_any, write, yield_now, STDOUT};
+use libsys::{brk, info, waitpid_any, waitpid_any_timeout, write, yield_now, STDOUT};
 
 /// console 实例总数（ADR-048 扩展 E1，owner 指令 2026-09-27）：构建期经
 /// `BORUIX_CONSOLES_N` 注入（init/build.rs，默认 4、钳 1..=256），与内核
@@ -28,6 +28,253 @@ const CONSOLES_N: usize = match option_env!("BORUIX_CONSOLES_N") {
 
 /// 会话模式（ADR-048 扩展 E3）：serial = 既有轮转形态（默认，零变化）；
 /// parallel = 每实例一个 login/shell 同时在场（会话账本对账重生）。
+
+/// 运行期实例硬上限（含预创建）。与内核 vfs::console::CONSOLES_MAX 同值
+/// （64）——跨仓常量无法单点定义（init 不依赖 vfs），以注释链对齐（S13
+/// 变通：两侧各一份、各自指明对方为真值来源；内核侧被
+/// test_console_runtime_create 钉死，漂移会被真机测试绊住）。
+/// 64 x 4KiB 环 = 256KiB 最坏内存，可预算（S33）。
+const CONSOLES_MAX: usize = 64;
+
+/// 运行期开新终端的控制文件协议目录（B3 owner 裁决：文件协议，零新
+/// syscall）：请求方 create /system/console-requests/<n>（n = 期望实例
+/// id，1..CONSOLES_MAX；0 恒为 /devices/console 别名不可请求）。同名
+/// create 冲突 = 该实例已被请求（AlreadyExists 天然去重，S21 竞态面收敛
+/// 到文件原子性）。init supervisor 循环枚举该目录：合法请求 → spawn
+/// consoled+login → 账本登记 → unlink 请求文件（消费）；非法请求文件
+/// 如实 unlink 丢弃并留痕。
+const CONSOLE_REQUESTS_DIR: &str = "/system/console-requests";
+
+/// parallel 会话模式下的等待片 = 巡检周期（B3-C2）：waitpid_any_timeout
+/// 的超时值就是请求巡检的最大响应延迟上界（200ms：交互可接受；等待片
+/// 期间不空转——超时即巡检，绝不忙转，S21）。
+const PATROL_PERIOD_NS: u64 = 200_000_000;
+
+/// 请求文件路径拼接（零堆形态，S17）：固定栈缓冲 = 前缀 + itoa。48 字节
+/// = 前缀 26 + 3 位数字（id<64 至多 2 位，防御性留 3 位）+ NUL 余量。
+/// 返回值借用 buf（同函数作用域内使用，非 static）。
+fn make_request_path<'a>(id: usize, buf: &'a mut [u8]) -> &'a str {
+    const PREFIX: &[u8] = b"/system/console-requests/";
+    let mut len = 0usize;
+    for b in PREFIX.iter() {
+        buf[len] = *b;
+        len += 1;
+    }
+    let mut digits = [0u8; 3];
+    let mut n = 0usize;
+    let mut v = id;
+    loop {
+        digits[n] = b'0' + (v % 10) as u8;
+        n += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    for k in (0..n).rev() {
+        buf[len] = digits[k];
+        len += 1;
+    }
+    core::str::from_utf8(&buf[..len]).unwrap_or("")
+}
+
+/// 请求文件名 → 实例 id：纯数字、1..CONSOLES_MAX（0 恒为 /devices/console
+/// 别名，永不可请求）才合法；长度上限 3 位数字（64 以内）。
+fn parse_instance_id(name: &str) -> Option<usize> {
+    let b = name.as_bytes();
+    if b.is_empty() || b.len() > 3 {
+        return None;
+    }
+    let mut n = 0usize;
+    for c in b.iter() {
+        if *c < b'0' || *c > b'9' {
+            return None;
+        }
+        n = n * 10 + (c - b'0') as usize;
+    }
+    Some(n)
+}
+
+/// 非法/重复请求的消费式丢弃：unlink 请求文件 + 原因留痕（S09/S10：
+/// 绝不静默吞——丢弃是有意识的裁决并留下可审计痕迹）。
+fn drop_request(id: usize, reason: &[u8]) {
+    let mut buf = [0u8; 48];
+    let _ = libsys::unlink(make_request_path(id, &mut buf));
+    let _ = write(STDOUT, b"[init] openvt request dropped: ");
+    let _ = write(STDOUT, reason);
+    let _ = write(STDOUT, b"\n");
+}
+
+/// Watchdog patrol for one cycle (B3-C2): extracted from the serial-loop
+/// inline block so parallel and serial share one implementation (S13).
+/// For every ledger entry, a pid missing from /processes/list means the
+/// consoled daemon died; respawn bound to the SAME instance id.
+fn watchdog_once(
+    ledger: &mut [(usize, u64); CONSOLES_MAX],
+    n: usize,
+) {
+// ADR-048 决策 4（T4）：按**守护账本**逐实例巡检——账本里每个
+// (instance, pid)，pid 已不在 /processes/list = 该实例守护死了，
+// 按**同一实例号** respawn（守护与实例一一对应，绝不串号）。
+// 僵尸由本循环 waitpid_any 收尸后从 procfs 消失，故「不在表」是
+// 真死亡的可观测判据（与 #6 看门狗同一真值源）。
+// procfs 快照：owned Vec 活到本巡检块结束（&str 借用随之合法，
+// no_std 无 alloc String，S31）。
+let procs_data = libsys::read_to_end("/processes/list").ok();
+let procs_text: Option<&str> = procs_data
+    .as_deref()
+    .and_then(|data| core::str::from_utf8(data).ok());
+let mut idx = 0usize;
+while idx < n {
+    let (inst, pid) = ledger[idx];
+    let alive = procs_text
+        .as_deref()
+        .map(|t| libsys::pid_of_name_alive(t, "consoled.elf", pid))
+        .unwrap_or(false);
+    if alive {
+        idx += 1;
+        continue;
+    }
+    // 死守护：按实例号 respawn（argv = 实例 id 十进制；argv 雏形
+    // argc=1，loader 硬编码）。
+    let mut argbuf = [0u8; 8];
+    let arg = dec_u64(inst as u64, &mut argbuf);
+    match libsys::exec_path("/programs/consoled.elf", arg) {
+        Ok(pid) => {
+            let mut buf = [0u8; 8];
+            let _ = write(STDOUT, b"[init] consoled was dead; respawned (pid ");
+            let _ = write(STDOUT, dec_u64(pid, &mut buf));
+            let _ = write(STDOUT, b")\n");
+            // 账本原位更新：旧 pid 已死，新 pid 接管同一实例。
+            ledger[idx] = (inst, pid);
+            idx += 1;
+        }
+        Err(_) => {
+            // respawn 失败：如实打印；**账本项保留**（下周期再试），
+            // idx 前进避免本轮死循环（失败不影响其他实例巡检）。
+            let _ = write(
+                STDOUT,
+                b"[init] consoled respawn FAILED; terminal stays dead this cycle\n",
+            );
+            idx += 1;
+        }
+    }
+}
+    
+}
+/// B3-C2 巡检（owner 裁决：文件协议，零新 syscall）：扫描
+/// /system/console-requests/，对每个请求文件——1) 校验 id（数字、
+/// 1..CONSOLES_MAX）；2) 查重（守护账本已有 = 幂等，靠文件名唯一性）；
+/// 3) spawn consoled(N)+login(N) 双账本登记（login 失败 = 守护在场 getty
+/// 缺位，与 respawn 失败同一诚实边界，请求 unlink 不自动重试——自动重试
+/// 会把一次误请求放大成永久守护，S20）；4) unlink = 消费确认。巡检只在
+/// init 单线程 supervisor 循环——无并发消费窗口（S21）。返回处理数。
+fn process_console_requests(
+    consoled_ledger: &mut [(usize, u64); CONSOLES_MAX],
+    consoled_n: &mut usize,
+    sessions: &mut [(u64, u64); CONSOLES_MAX],
+    spawned: &mut usize,
+) -> usize {
+    let entries = match libsys::read_dir(CONSOLE_REQUESTS_DIR) {
+        Ok(e) => e,
+        Err(_) => return 0, // 目录不存在 = 从未有请求（骨架不预建，省启动写）
+    };
+    let mut handled = 0usize;
+    for entry in entries.iter() {
+        let name = entry.name.as_str();
+        let id = match parse_instance_id(name) {
+            Some(n) => n,
+            None => {
+                drop_bad_name_request(name);
+                continue;
+            }
+        };
+        if id == 0 || id >= CONSOLES_MAX {
+            drop_request(id, b"instance id out of range");
+            continue;
+        }
+        let mut known = false;
+        for i in 0..*consoled_n {
+            if consoled_ledger[i].0 == id {
+                known = true;
+                break;
+            }
+        }
+        if known {
+            drop_request(id, b"instance already provisioned");
+            continue;
+        }
+        handled += spawn_instance_pair(id, consoled_ledger, consoled_n, sessions, spawned);
+    }
+    handled
+}
+
+/// 非数字请求文件名的消费：名字不可解析 → 直接拼目录前缀 + 原名 unlink
+/// （截断防御：名字超长时保前缀安全余量，S19）。
+fn drop_bad_name_request(name: &str) {
+    let mut buf = [0u8; 64];
+    const DIRP: &[u8] = b"/system/console-requests/";
+    let mut l = 0usize;
+    for b in DIRP.iter() {
+        buf[l] = *b;
+        l += 1;
+    }
+    let nb = name.as_bytes();
+    let remain = buf.len() - l;
+    let take = if nb.len() < remain { nb.len() } else { remain - 1 };
+    buf[l..l + take].copy_from_slice(&nb[..take]);
+    l += take;
+    if let Ok(p) = core::str::from_utf8(&buf[..l]) {
+        let _ = libsys::unlink(p);
+    }
+    let _ = write(STDOUT, b"[init] openvt request dropped (bad name)\n");
+}
+
+/// 单请求实例化：spawn consoled(N)（守护账本登记）+ login(N)（会话账本
+/// 登记）+ unlink 请求文件 + 串口留痕。返回 1（成功）或 0（失败路径，
+/// 失败细节见各 drop 留痕）。
+fn spawn_instance_pair(
+    id: usize,
+    consoled_ledger: &mut [(usize, u64); CONSOLES_MAX],
+    consoled_n: &mut usize,
+    sessions: &mut [(u64, u64); CONSOLES_MAX],
+    spawned: &mut usize,
+) -> usize {
+    let mut ab = [0u8; 8];
+    let arg = dec_u64(id as u64, &mut ab);
+    let cpid = match libsys::exec_path("/programs/consoled.elf", arg) {
+        Ok(p) => p,
+        Err(_) => {
+            drop_request(id, b"consoled spawn failed");
+            return 0;
+        }
+    };
+    consoled_ledger[*consoled_n] = (id, cpid);
+    *consoled_n += 1;
+    let lpid = match libsys::exec_path("/programs/login.elf", arg) {
+        Ok(p) => p,
+        Err(_) => {
+            drop_request(id, b"login spawn failed");
+            return 0;
+        }
+    };
+    if *spawned < CONSOLES_MAX {
+        sessions[*spawned] = (id as u64, lpid);
+        *spawned += 1;
+    }
+    let mut buf = [0u8; 48];
+    let _ = libsys::unlink(make_request_path(id, &mut buf));
+    let mut nb = [0u8; 8];
+    let _ = write(STDOUT, b"[init] openvt: instance ");
+    let _ = write(STDOUT, dec_u64(id as u64, &mut nb));
+    let _ = write(STDOUT, b" created (consoled pid ");
+    let _ = write(STDOUT, dec_u64(cpid as u64, &mut nb));
+    let _ = write(STDOUT, b", login pid ");
+    let _ = write(STDOUT, dec_u64(lpid as u64, &mut nb));
+    let _ = write(STDOUT, b")\n");
+    1
+}
+
 const SESSION_MODE_PARALLEL: bool = match option_env!("BORUIX_SESSION_MODE") {
     // const 上下文不能对 &str/[u8] 判等（PartialEq 未 const 稳定）——手写
     // const fn 字节循环比对（const_parse_usize 同款纯 const 形态，S13）。
@@ -757,7 +1004,7 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     // 硬编码 argc=1），consoled parse_instance 读 argv[0] 解析实例 id。
     // 守护账本：定长栈数组（S31：init 零堆依赖——no_std 且未链 alloc，
     // 不为此引入堆）。容量 = 实例上限（ADR-048 N=4），账本只会更短。
-    let mut consoled_ledger: [(usize, u64); CONSOLES_N] = [(0, 0); CONSOLES_N];
+    let mut consoled_ledger: [(usize, u64); CONSOLES_MAX] = [(0, 0); CONSOLES_MAX];
     let mut consoled_n: usize = 0;
     // T5-b（owner 裁决 B）：**每实例一守护**——事件流是广播语义（P1 多读者
     // 各持游标看全量），consoled[N] 各读全量事件、写环 N；非焦点实例的写被
@@ -921,8 +1168,16 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     // 焦点语义（诚实边界，S20 先行）：parallel 下 getty 重生即焦点转移
     //（login 认证前 focus_set），焦点恒单点；多物理终端的用户态切换器
     // 留 E4（本版不做，ADR-048 §4 记录）。
+    // B3-C2: create the request dir once (idempotent; AlreadyExists ignored).
+    // Without it, user create of a request file fails on missing parent.
+    // Serial mode gets it too: one protocol for both modes (S13).
+    let _ = libsys::mkdir(
+        CONSOLE_REQUESTS_DIR,
+        libsys::Permissions::all(),
+    );
+
     if SESSION_MODE_PARALLEL {
-        let mut sessions: [(u64, u64); CONSOLES_N] = [(0, 0); CONSOLES_N]; // (instance, pid)
+        let mut sessions: [(u64, u64); CONSOLES_MAX] = [(0, 0); CONSOLES_MAX]; // (instance, pid)
         let mut spawned: usize = 0;
         for inst in 0..CONSOLES_N {
             let mut ib = [0u8; 8];
@@ -949,7 +1204,9 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         // parallel 主循环：只等 + 对账重生（看门狗复用 serial 同款巡检——
         // 守护账本巡检是无状态的，每轮跑一次即可，直接内联同一段）。
         loop {
-            match waitpid_any() {
+            // B3-C2：有界等待（§6.11 裁决 B 同款形态）——等待片 = 巡检周期。
+            // 超时分支做 openvt 请求巡检（consoled 看门狗同款穿插）。
+            match waitpid_any_timeout(PATROL_PERIOD_NS) {
                 Ok(wr) => {
                     // 对账：退出 pid 在账本里 → 该实例会话死了，原位重生。
                     let mut hit: Option<usize> = None;
@@ -1006,8 +1263,20 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
                         }
                     }
                 }
+                Err(libsys::Error::WouldBlock) => {
+                    // 等待片超时（无子进程退出）= 巡检时机：openvt 请求
+                    // 消费 + consoled 看门狗（共用同一节奏，绝不忙转——
+                    // 下一轮 waitpid_any_timeout 重新阻塞等待）。
+                    process_console_requests(
+                        &mut consoled_ledger,
+                        &mut consoled_n,
+                        &mut sessions,
+                        &mut spawned,
+                    );
+                    watchdog_once(&mut consoled_ledger, consoled_n);
+                }
                 Err(_) => {
-                    // 无就绪者：短眠（与 serial 同款，绝不忙转）。
+                    // 非预期等待错误：短眠（与 serial 同款，绝不忙转）。
                     let _ = libsys::sleep(100_000_000);
                 }
             }
@@ -1028,55 +1297,7 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         // S20 最忌形态；wd13 实测复现了这一错误）。无条件 exec 不可行：consoled
         // 存活时重复 spawn = 双生产者交错写环，比「守护死了」更糟（S20）。
         // spawn 失败如实打印并继续（下周期再试）。
-        {
-            // ADR-048 决策 4（T4）：按**守护账本**逐实例巡检——账本里每个
-            // (instance, pid)，pid 已不在 /processes/list = 该实例守护死了，
-            // 按**同一实例号** respawn（守护与实例一一对应，绝不串号）。
-            // 僵尸由本循环 waitpid_any 收尸后从 procfs 消失，故「不在表」是
-            // 真死亡的可观测判据（与 #6 看门狗同一真值源）。
-            // procfs 快照：owned Vec 活到本巡检块结束（&str 借用随之合法，
-            // no_std 无 alloc String，S31）。
-            let procs_data = libsys::read_to_end("/processes/list").ok();
-            let procs_text: Option<&str> = procs_data
-                .as_deref()
-                .and_then(|data| core::str::from_utf8(data).ok());
-            let mut idx = 0usize;
-            while idx < consoled_n {
-                let (inst, pid) = consoled_ledger[idx];
-                let alive = procs_text
-                    .as_deref()
-                    .map(|t| libsys::pid_of_name_alive(t, "consoled.elf", pid))
-                    .unwrap_or(false);
-                if alive {
-                    idx += 1;
-                    continue;
-                }
-                // 死守护：按实例号 respawn（argv = 实例 id 十进制；argv 雏形
-                // argc=1，loader 硬编码）。
-                let mut argbuf = [0u8; 8];
-                let arg = dec_u64(inst as u64, &mut argbuf);
-                match libsys::exec_path("/programs/consoled.elf", arg) {
-                    Ok(pid) => {
-                        let mut buf = [0u8; 8];
-                        let _ = write(STDOUT, b"[init] consoled was dead; respawned (pid ");
-                        let _ = write(STDOUT, dec_u64(pid, &mut buf));
-                        let _ = write(STDOUT, b")\n");
-                        // 账本原位更新：旧 pid 已死，新 pid 接管同一实例。
-                        consoled_ledger[idx] = (inst, pid);
-                        idx += 1;
-                    }
-                    Err(_) => {
-                        // respawn 失败：如实打印；**账本项保留**（下周期再试），
-                        // idx 前进避免本轮死循环（失败不影响其他实例巡检）。
-                        let _ = write(
-                            STDOUT,
-                            b"[init] consoled respawn FAILED; terminal stays dead this cycle\n",
-                        );
-                        idx += 1;
-                    }
-                }
-            }
-        }
+                watchdog_once(&mut consoled_ledger, consoled_n);
 
         // ---- 重生点：只有走到这里才拉起新 login（认证关口）----
         // T5-c：argv = 轮转实例号（loader argv 雏形 argc=1）——login 绑定
