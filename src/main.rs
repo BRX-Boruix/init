@@ -80,6 +80,30 @@ fn make_request_path<'a>(id: usize, buf: &'a mut [u8]) -> &'a str {
     core::str::from_utf8(&buf[..len]).unwrap_or("")
 }
 
+/// 实例设备节点路径拼接（/devices/consoles/<id>，零堆同款 S17）。
+/// 32 = 前缀 19 + 2 位数字 + 余量。
+fn make_device_path<'a>(id: usize, buf: &'a mut [u8]) -> &'a str {
+    const PREFIX: &[u8] = b"/devices/consoles/";
+    let mut len = 0usize;
+    for b in PREFIX.iter() {
+        buf[len] = *b;
+        len += 1;
+    }
+    let mut digits = [0u8; 2];
+    let mut n = 0usize;
+    let mut v = id;
+    while v > 0 {
+        digits[n] = b'0' + (v % 10) as u8;
+        n += 1;
+        v /= 10;
+    }
+    for k in (0..n).rev() {
+        buf[len] = digits[k];
+        len += 1;
+    }
+    core::str::from_utf8(&buf[..len]).unwrap_or("")
+}
+
 /// 请求文件名 → 实例 id：纯数字、1..CONSOLES_MAX（0 恒为 /devices/console
 /// 别名，永不可请求）才合法；长度上限 3 位数字（64 以内）。
 fn parse_instance_id(name: &str) -> Option<usize> {
@@ -100,8 +124,17 @@ fn parse_instance_id(name: &str) -> Option<usize> {
 /// 非法/重复请求的消费式丢弃：unlink 请求文件 + 原因留痕（S09/S10：
 /// 绝不静默吞——丢弃是有意识的裁决并留下可审计痕迹）。
 fn drop_request(id: usize, reason: &[u8]) {
+    // 消费式丢弃 = unlink 请求文件（S09：失败如实留痕，绝不 `let _ =`
+    // 吞错——吞掉会让请求文件残留，巡检每周期重复 drop 同一请求，
+    // 曾实证为 671 次刷屏）。NotFound = 已被并发消费，视为成功。
     let mut buf = [0u8; 48];
-    let _ = libsys::unlink(make_request_path(id, &mut buf));
+    if let Err(e) = libsys::unlink(make_request_path(id, &mut buf)) {
+        if e != libsys::Error::NotFound {
+            let _ = write(STDOUT, b"[init] WARN: request unlink failed: ");
+            let _ = write(STDOUT, reason);
+            let _ = write(STDOUT, b"\n");
+        }
+    }
     let _ = write(STDOUT, b"[init] openvt request dropped: ");
     let _ = write(STDOUT, reason);
     let _ = write(STDOUT, b"\n");
@@ -242,6 +275,41 @@ fn spawn_instance_pair(
     sessions: &mut [(u64, u64); CONSOLES_MAX],
     spawned: &mut usize,
 ) -> usize {
+    // B3-C3 接线（S20 先物化后 spawn）：实例节点 /devices/consoles/<id>
+    // 必须在 consoled/login 启动**之前**存在——它们用 READ_ONLY 打开该
+    // 节点绑定 stdin（login bind 语义），节点缺失 = 会话 errno 2 立死
+    //（实证：cannot bind console instance 4）。物化走 open(CREATE) →
+    // 内核 consoles 目录 create 回调 → create_instance（节点+环同事务）。
+    // AlreadyExists = 已存在（幂等，继续）；其他错误 = 如实 drop。
+    {
+        let mut mb = [0u8; 32];
+        let mp = make_device_path(id, &mut mb);
+        match libsys::open(
+            mp,
+            libsys::OpenFlags {
+                read: true,
+                write: true,
+                create: true,
+                // 无 truncate：ConsoleNode 是字符流（truncate=NotSupported），
+                // 重复请求时 resolve 命中已有节点会走 truncate 分支而误报。
+                // 创建语义只需 create 位（S17：不夹带无关副作用）。
+                truncate: false,
+                append: false,
+                directory: false,
+                pipe: false,
+            },
+            libsys::Permissions::all(),
+        ) {
+            Ok(fd) => {
+                let _ = libsys::close(fd);
+            }
+            Err(libsys::Error::AlreadyExists) => {}
+            Err(_) => {
+                drop_request(id, b"instance node materialize failed");
+                return 0;
+            }
+        }
+    }
     let mut ab = [0u8; 8];
     let arg = dec_u64(id as u64, &mut ab);
     let cpid = match libsys::exec_path("/programs/consoled.elf", arg) {
@@ -265,7 +333,18 @@ fn spawn_instance_pair(
         *spawned += 1;
     }
     let mut buf = [0u8; 48];
-    let _ = libsys::unlink(make_request_path(id, &mut buf));
+    if let Err(e) = libsys::unlink(make_request_path(id, &mut buf)) {
+        if e != libsys::Error::NotFound {
+            let mut eb = [0u8; 8];
+            let _ = write(STDOUT, b"[init] WARN: consumed request unlink failed rc=");
+            let _ = write(STDOUT, dec_u64(match e {
+                libsys::Error::PermissionDenied => 13,
+                libsys::Error::InvalidParam => 22,
+                _ => 9,
+            }, &mut eb));
+            let _ = write(STDOUT, b"\n");
+        }
+    }
     let mut nb = [0u8; 8];
     let _ = write(STDOUT, b"[init] openvt: instance ");
     let _ = write(STDOUT, dec_u64(id as u64, &mut nb));
