@@ -1104,11 +1104,16 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
                     consoled_ledger[consoled_n] = (inst, pid);
                     consoled_n += 1;
                 }
-                Err(_) => {
+                Err(e) => {
+                    // 如实报告失败原因（errno）：旧实现丢弃错误，只报"failed"——无法区分
+                    // 目标缺失（2）与资源不足（28）等根因，违反"如实报告"纪律。
+                    let mut eb = [0u8; 8];
                     let _ = write(
                         STDOUT,
-                        b"[init] exec_path(consoled.elf) failed; stdin has NO producer (terminal dead)\n",
+                        b"[init] exec_path(consoled.elf) failed; stdin has NO producer (terminal dead) errno=",
                     );
+                    let _ = write(STDOUT, dec_u64(e.to_errno() as u64, &mut eb));
+                    let _ = write(STDOUT, b"\n");
                 }
             }
         }
@@ -1225,8 +1230,11 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
                     }
                 }
             }
-            Err(_) => {
-                let _ = write(STDOUT, b"[init] exec_path(login.elf) failed\n");
+            Err(e) => {
+                let mut eb = [0u8; 8];
+                let _ = write(STDOUT, b"[init] exec_path(login.elf) failed errno=");
+                let _ = write(STDOUT, dec_u64(e.to_errno() as u64, &mut eb));
+                let _ = write(STDOUT, b"\n");
             }
         }
         } // E3: serial-only 首会话
