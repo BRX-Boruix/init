@@ -587,6 +587,19 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
         }
     }
 
+    // BORUIX_INIT_RUN：与 BORUIX_INIT_ARGS 同源的构建期注入，但**不切分**——整串原样
+    // 作为 --run= 的命令行交给 shell。存在理由：BORUIX_INIT_ARGS 按空白切分，无法表达
+    // "程序名 + 长参数/含空格参数"（实测 --run=echo hello 只传了 echo，于是 shell 输出一个
+    // 空行——曾被误读为"内建命令无输出"的缺陷）。3P4-2 的验收要求"实测一条 >511B 的
+    // 命令行"，本通道即其注入形态。
+    //
+    // 优先级**最高**（高于运行期 argv 与 BORUIX_INIT_ARGS）：它是最无歧义的意图表达。
+    if let Some(raw) = option_env!("BORUIX_INIT_RUN") {
+        if !raw.is_empty() {
+            run_cmd = Some(raw.as_bytes());
+        }
+    }
+
     // 1. 欢迎信息（验证 write）。
     let _ = write(STDOUT, b"[init] Hello from real userspace (Rust + libsys)!\n");
 

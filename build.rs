@@ -24,6 +24,15 @@ fn main() {
         println!("cargo:rustc-env=BORUIX_INIT_ARGS={}", extra);
     }
 
+    // BORUIX_INIT_RUN：同一注入手法的第二种形态——**不按空白切分**，整串原样作为
+    // --run= 的命令行交给 shell。为什么需要它：BORUIX_INIT_ARGS 按空白切分，无法注入
+    // "程序名 + 长参数"形态（实测 --run=echo hello 只传了 echo），而 3P4-2 的验收要求
+    // "实测一条 >511B 的命令行"，cc1 那类超长参数也需要它。
+    println!("cargo:rerun-if-env-changed=BORUIX_INIT_RUN");
+    if let Ok(raw) = std::env::var("BORUIX_INIT_RUN") {
+        println!("cargo:rustc-env=BORUIX_INIT_RUN={}", raw);
+    }
+
     // ADR-048 扩展 E1（owner 指令 2026-09-27）：console 实例总数与内核 vfs 侧
     // 同源注入（vfs/build.rs 同款钳位 1..=256、默认 4）——init 的守护 spawn
     // 循环与会话轮转位跟 N 走，与 devfs 挂载的实例族形状**同源对齐**（S13：
