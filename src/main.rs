@@ -297,6 +297,9 @@ fn spawn_instance_pair(
                 append: false,
                 directory: false,
                 pipe: false,
+                // 不设 CLOEXEC：本 fd 只在本进程内短暂使用（3P4-3 的位已就位，
+                // 需要"不给子进程继承"的场景可显式打开它）。
+                cloexec: false,
             },
             libsys::Permissions::all(),
         ) {
