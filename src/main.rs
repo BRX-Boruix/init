@@ -300,6 +300,9 @@ fn spawn_instance_pair(
                 // 不设 CLOEXEC：本 fd 只在本进程内短暂使用（3P4-3 的位已就位，
                 // 需要"不给子进程继承"的场景可显式打开它）。
                 cloexec: false,
+                // 不带 O_EXCL：这里要的是幂等物化（AlreadyExists 已被显式当成功处理），
+                // 加独占位反而会把「已存在」变成 open 错误，与下面的幂等分支冲突。
+                exclusive: false,
             },
             libsys::Permissions::all(),
         ) {
