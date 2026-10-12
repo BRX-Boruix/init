@@ -1048,7 +1048,15 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     // 优先级最低：--selftest / --selftest-quick 语义明确，若同时给出以它们为准。
     if let Some(cmd) = run_cmd {
         if !run_selftest && !run_selftest_quick {
-            let _ = write(STDOUT, b"[init] running non-interactive command: ");
+            // **自报身份**（2026-10 加）：三个自动化通道（--selftest / --selftest-quick / --run=）
+            // **故意**跑在 login 降权之前（见下方 login 段的说明）⇒ 它们持 init 的 system()
+            // 全能力、**含 CAP_OWNER**，而 CAP_OWNER 完全绕过策略求值。任何**验证权限行为**的程序
+            // 若走这些通道，看到的都是特权进程——我因此连续三次误判「内核不拦截权限」。
+            // 把身份印出来，这个陷阱就一眼可见。
+            let _ = write(
+                STDOUT,
+                b"[init] running non-interactive command (PRIVILEGED: uid 0, caps=SYSTEM|DEVICE|MEMORY|KILL|OWNER): ",
+            );
             let _ = write(STDOUT, cmd);
             let _ = write(STDOUT, b"\n");
             match libsys::exec_path("/programs/shell.elf", cmd) {
