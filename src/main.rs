@@ -52,16 +52,20 @@ const CONSOLE_REQUESTS_DIR: &str = "/system/console-requests";
 /// 期间不空转——超时即巡检，绝不忙转，S21）。
 const PATROL_PERIOD_NS: u64 = 200_000_000;
 
-/// 请求文件路径拼接（零堆形态，S17）：固定栈缓冲 = 前缀 + itoa。48 字节
-/// = 前缀 26 + 3 位数字（id<64 至多 2 位，防御性留 3 位）+ NUL 余量。
+/// 请求文件路径拼接（零堆形态，S17）：固定栈缓冲 = 目录 + '/' + itoa。48 字节
+/// = 目录 24 + 斜杠 + 3 位数字（id<64 至多 2 位，防御性留 3 位）+ NUL 余量。
 /// 返回值借用 buf（同函数作用域内使用，非 static）。
+///
+/// 前缀**由 [@BT@CONSOLE_REQUESTS_DIR@BT@] 派生**而不是另写一份字面量——此前这里与本文件
+/// 另两处各写了一遍同一路径，改一处漏两处不会有任何东西报错（S13）。
 fn make_request_path<'a>(id: usize, buf: &'a mut [u8]) -> &'a str {
-    const PREFIX: &[u8] = b"/system/console-requests/";
     let mut len = 0usize;
-    for b in PREFIX.iter() {
+    for b in CONSOLE_REQUESTS_DIR.as_bytes() {
         buf[len] = *b;
         len += 1;
     }
+    buf[len] = b'/';
+    len += 1;
     let mut digits = [0u8; 3];
     let mut n = 0usize;
     let mut v = id;
@@ -248,12 +252,13 @@ fn process_console_requests(
 /// （截断防御：名字超长时保前缀安全余量，S19）。
 fn drop_bad_name_request(name: &str) {
     let mut buf = [0u8; 64];
-    const DIRP: &[u8] = b"/system/console-requests/";
     let mut l = 0usize;
-    for b in DIRP.iter() {
+    for b in CONSOLE_REQUESTS_DIR.as_bytes() {
         buf[l] = *b;
         l += 1;
     }
+    buf[l] = b'/';
+    l += 1;
     let nb = name.as_bytes();
     let remain = buf.len() - l;
     let take = if nb.len() < remain { nb.len() } else { remain - 1 };
