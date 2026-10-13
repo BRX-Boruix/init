@@ -160,16 +160,23 @@ fn watchdog_once(
 // procfs 快照：owned Vec 活到本巡检块结束（&str 借用随之合法，
 // no_std 无 alloc String，S31）。
 let procs_data = libsys::read_to_end("/processes/list").ok();
-let procs_text: Option<&str> = procs_data
+let Some(procs) = procs_data
     .as_deref()
-    .and_then(|data| core::str::from_utf8(data).ok());
+    .and_then(|data| core::str::from_utf8(data).ok())
+else {
+    // **读不到进程表 ⇒ 本轮不巡检**。此前这里把 None 折叠成 `alive = false`，
+    // 于是"读失败"被当成"每个守护都死了"——会**重复拉起每一个 consoled**
+    // （同一实例两个守护同时写同一个 console 环）。宁可晚一轮，不造假结论（S09）。
+    let _ = write(
+        STDOUT,
+        b"[init] watchdog: process list unavailable; patrol skipped\n",
+    );
+    return;
+};
 let mut idx = 0usize;
 while idx < n {
     let (inst, pid) = ledger[idx];
-    let alive = procs_text
-        .as_deref()
-        .map(|t| libsys::pid_of_name_alive(t, "consoled.elf", pid))
-        .unwrap_or(false);
+    let alive = libsys::pid_of_name_alive(procs, "consoled.elf", pid);
     if alive {
         idx += 1;
         continue;
