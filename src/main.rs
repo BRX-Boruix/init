@@ -87,7 +87,8 @@ fn make_request_path<'a>(id: usize, buf: &'a mut [u8]) -> &'a str {
 /// 实例设备节点路径拼接（/devices/consoles/<id>，零堆同款 S17）。
 /// 32 = 前缀 19 + 2 位数字 + 余量。
 fn make_device_path<'a>(id: usize, buf: &'a mut [u8]) -> &'a str {
-    const PREFIX: &[u8] = b"/devices/consoles/";
+    // **用户态单一事实源**（libsys）：不再在本文件重写这份字面量。
+    const PREFIX: &[u8] = libsys::CONSOLES_DIR_PREFIX.as_bytes();
     let mut len = 0usize;
     for b in PREFIX.iter() {
         buf[len] = *b;
