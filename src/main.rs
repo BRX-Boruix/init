@@ -659,7 +659,8 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     // 盘可能不存在（未挂 -drive），故失败只如实记录，不阻断启动。
     {
         let _ = write(STDOUT, b"[init] probing data disk contents...\n");
-        let probe = "/volumes/BORUIX_DATA/welcome.txt";
+        // 路径由 tools/abi/constants.json 生成，经 libsys 导出（不再是本文件里的字面量）。
+    let probe = libsys::WELCOME_PROBE;
         match libsys::read_to_end(probe) {
             Ok(bytes) => {
                 let _ = write(STDOUT, b"[init] read ");
