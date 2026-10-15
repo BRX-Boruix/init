@@ -56,7 +56,7 @@ const PATROL_PERIOD_NS: u64 = 200_000_000;
 /// = 目录 24 + 斜杠 + 3 位数字（id<64 至多 2 位，防御性留 3 位）+ NUL 余量。
 /// 返回值借用 buf（同函数作用域内使用，非 static）。
 ///
-/// 前缀**由 [@BT@CONSOLE_REQUESTS_DIR@BT@] 派生**而不是另写一份字面量——此前这里与本文件
+/// 前缀**由 [`CONSOLE_REQUESTS_DIR`] 派生**而不是另写一份字面量——此前这里与本文件
 /// 另两处各写了一遍同一路径，改一处漏两处不会有任何东西报错（S13）。
 fn make_request_path<'a>(id: usize, buf: &'a mut [u8]) -> &'a str {
     let mut len = 0usize;
