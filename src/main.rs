@@ -652,40 +652,24 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
 
     // 4.0 数据盘内容自检：证明 disk.img 的文件**真能被读出**，而不只是挂上了。
     //
-    // 挂载成功只说明 EXT2 超级块可解析；内容是否正确取决于 SDK 写入路径
-    // （tools/diskfiles -> mkimg -> disk.img）与内核读取路径是否真的对上。
-    // 二者中间的任一处出错，"挂载成功"都会照样打印。故此处实读一个文件。
-    //
-    // 盘可能不存在（未挂 -drive），故失败只如实记录，不阻断启动。
+    // 挂载成功只说明 EXT2 超级块可解析。这里**只报告实际挂上了哪些卷**——
+    // 不假定盘上有任何特定文件、也不假定盘叫什么：那是数据，系统不需要知道。
+    // 一块盘都没插是**合法状态**，如实打印即可，不阻断启动。
     {
-        let _ = write(STDOUT, b"[init] probing data disk contents...\n");
-        // 数据盘的**位置**是部署事实：卷标可能不同、可能没有第二块盘、`3p` 也可能在系统盘上。
-        // 故运行期在**已挂载卷的根**上找 `welcome.txt`，而不是断言某个编译期路径——
-        // 后者在真实部署下会指向不存在的文件，而「文件不存在」与「盘没插」在日志里无法区分。
-        let found = libsys::find_volume_file("welcome.txt");
-        match found.map(|p| (p.clone(), libsys::read_to_end(&p))) {
-            Some((path, Ok(bytes))) => {
-                let _ = write(STDOUT, b"[init] read ");
-                let _ = write(STDOUT, path.as_bytes());
-                let _ = write(STDOUT, b" (");
-                let mut nbuf = [0u8; 8];
-                let _ = write(STDOUT, dec_u64(bytes.len() as u64, &mut nbuf));
-                let _ = write(STDOUT, b" bytes), first line: ");
-                // 只打印首行，避免刷屏；同时足以证明内容来自 diskfiles 而非硬编码。
-                let end = bytes.iter().position(|&b| b == b'\n').unwrap_or(bytes.len());
-                let _ = write(STDOUT, &bytes[..end]);
-                let _ = write(STDOUT, b"\n");
+        let _ = write(STDOUT, b"[init] mounted volumes:\n");
+        match libsys::read_dir("/volumes") {
+            Ok(entries) if !entries.is_empty() => {
+                for e in entries.iter() {
+                    let _ = write(STDOUT, b"[init]   /volumes/");
+                    let _ = write(STDOUT, e.name.as_bytes());
+                    let _ = write(STDOUT, b"\n");
+                }
             }
-            Some((path, Err(_))) => {
-                let _ = write(STDOUT, b"[init] welcome.txt found at ");
-                let _ = write(STDOUT, path.as_bytes());
-                let _ = write(STDOUT, b" but unreadable (non-fatal)\n");
+            Ok(_) => {
+                let _ = write(STDOUT, b"[init]   (none)\n");
             }
-            None => {
-                let _ = write(
-                    STDOUT,
-                    b"[init] no mounted volume carries welcome.txt (non-fatal)\n",
-                );
+            Err(_) => {
+                let _ = write(STDOUT, b"[init]   /volumes unavailable\n");
             }
         }
     }
