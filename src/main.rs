@@ -659,12 +659,14 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
     // 盘可能不存在（未挂 -drive），故失败只如实记录，不阻断启动。
     {
         let _ = write(STDOUT, b"[init] probing data disk contents...\n");
-        // 路径由 tools/abi/constants.json 生成，经 libsys 导出（不再是本文件里的字面量）。
-    let probe = libsys::WELCOME_PROBE;
-        match libsys::read_to_end(probe) {
-            Ok(bytes) => {
+        // 数据盘的**位置**是部署事实：卷标可能不同、可能没有第二块盘、`3p` 也可能在系统盘上。
+        // 故运行期在**已挂载卷的根**上找 `welcome.txt`，而不是断言某个编译期路径——
+        // 后者在真实部署下会指向不存在的文件，而「文件不存在」与「盘没插」在日志里无法区分。
+        let found = libsys::find_volume_file("welcome.txt");
+        match found.map(|p| (p.clone(), libsys::read_to_end(&p))) {
+            Some((path, Ok(bytes))) => {
                 let _ = write(STDOUT, b"[init] read ");
-                let _ = write(STDOUT, probe.as_bytes());
+                let _ = write(STDOUT, path.as_bytes());
                 let _ = write(STDOUT, b" (");
                 let mut nbuf = [0u8; 8];
                 let _ = write(STDOUT, dec_u64(bytes.len() as u64, &mut nbuf));
@@ -674,10 +676,15 @@ pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
                 let _ = write(STDOUT, &bytes[..end]);
                 let _ = write(STDOUT, b"\n");
             }
-            Err(_) => {
+            Some((path, Err(_))) => {
+                let _ = write(STDOUT, b"[init] welcome.txt found at ");
+                let _ = write(STDOUT, path.as_bytes());
+                let _ = write(STDOUT, b" but unreadable (non-fatal)\n");
+            }
+            None => {
                 let _ = write(
                     STDOUT,
-                    b"[init] data disk not present or /volumes/BORUIX_DATA/welcome.txt missing (non-fatal)\n",
+                    b"[init] no mounted volume carries welcome.txt (non-fatal)\n",
                 );
             }
         }
